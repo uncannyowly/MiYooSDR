@@ -15,6 +15,11 @@ and other 2.4 GHz traffic around you, zoom in, and record what you see.
 > It is **receive-only**: it only measures energy, never transmits, and it cannot
 > demodulate or decode any signal. It restores Wi-Fi when it exits.
 
+Besides the live spectrum and waterfall it also has a **channel occupancy** view
+(per Wi-Fi-channel activity bars, to find a clear channel), **signal-to-sound**
+(a tone that rises as you move the cursor onto a signal, handy for direction
+finding), and a **review** mode that replays saved recordings on the handheld.
+
 ![MiYooSDR showing a 2.4 GHz spectrum and waterfall](docs/screenshot.png)
 
 ## Requirements
@@ -41,6 +46,9 @@ a few seconds).
 | SELECT (tap) | Jump the cursor to the strongest peak |
 | SELECT + Y | Cycle the spectrum view: line, filled, filled with Wi-Fi band shading |
 | SELECT + A | Cycle the colour palette (Ember, Spectrum, Ice, Matrix) |
+| SELECT + B | Switch the lower panel between waterfall and channel occupancy |
+| SELECT + X | Signal-to-sound: a tone whose pitch follows the level under the cursor |
+| SELECT + START | Open the recording browser to replay a saved capture |
 | Y | Enhance: show dB above the slow background instead of absolute level |
 | A | Show or hide the max-hold trace |
 | B | Clear the hold, average and waterfall |

@@ -17,6 +17,13 @@ log() { echo "$(date +%T) $*" >> "$LOG"; }
 had_wpa=0; pgrep wpa_supplicant >/dev/null 2>&1 && had_wpa=1
 was_up=0; ifconfig wlan0 2>/dev/null | grep -q UP && was_up=1
 
+# free the audio device so the app's signal-to-sound can use MI_AO directly
+AUDIOSERVER=""
+for a in /mnt/SDCARD/.tmp_update/bin/audioserver /customer/app/audioserver; do
+	[ -x "$a" ] && AUDIOSERVER="$a" && break
+done
+had_audio=0; pgrep audioserver >/dev/null 2>&1 && had_audio=1
+
 restore() {
 	trap - EXIT INT TERM HUP
 	log "restore: Wi-Fi (was_up=$was_up had_wpa=$had_wpa)"
@@ -27,6 +34,10 @@ restore() {
 		$WPA -B -D nl80211 -iwlan0 -c /appconfigs/wpa_supplicant.conf >> "$LOG" 2>&1
 		udhcpc -i wlan0 -s /etc/init.d/udhcpc.script > /dev/null 2>&1 &
 		$IW dev wlan0 set power_save off > /dev/null 2>&1
+	fi
+	# give Onion its audio back
+	if [ $had_audio = 1 ] && [ -n "$AUDIOSERVER" ] && ! pgrep audioserver >/dev/null 2>&1; then
+		"$AUDIOSERVER" >/dev/null 2>&1 &
 	fi
 	log "restore: done"
 	sync
@@ -52,6 +63,12 @@ ifconfig wlan0 up
 $IW dev wlan0 disconnect >> "$LOG" 2>&1
 echo "1 0 0" > /proc/net/rtl8188fu/wlan0/monitor
 cat /proc/net/rtl8188fu/wlan0/rf_info >> "$LOG" 2>&1
+
+# hand the audio device to the app (signal-to-sound). Onion gets it back on exit.
+if [ $had_audio = 1 ]; then
+	killall -9 audioserver 2>/dev/null
+	sleep 0.2
+fi
 
 chmod +x "$APPDIR/miyoosdr"
 "$APPDIR/miyoosdr" "$@" >> "$LOG" 2>&1
