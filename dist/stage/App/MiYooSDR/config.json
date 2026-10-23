@@ -1,6 +1,0 @@
-{
-	"label": "MiYooSDR",
-	"icon": "icon.png",
-	"launch": "launch.sh",
-	"description": "2.4 GHz spectrum analyzer and waterfall"
-}

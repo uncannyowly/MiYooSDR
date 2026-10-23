@@ -2,3 +2,4 @@ build/
 *.ppm
 app/MiYooSDR/miyoosdr
 app/MiYooSDR/rec/
+dist/
