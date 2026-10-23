@@ -38,7 +38,9 @@ a few seconds).
 | --- | --- |
 | R2 / L2 | Zoom in / out (full band, then 20, 10, 5 MHz around the cursor) |
 | D-pad Left / Right | Move the cursor (pans the view at the edges when zoomed) |
-| SELECT | Jump the cursor to the strongest peak |
+| SELECT (tap) | Jump the cursor to the strongest peak |
+| SELECT + Y | Cycle the spectrum view: line, filled, filled with Wi-Fi band shading |
+| SELECT + A | Cycle the colour palette (Ember, Spectrum, Ice, Matrix) |
 | Y | Enhance: show dB above the slow background instead of absolute level |
 | A | Show or hide the max-hold trace |
 | B | Clear the hold, average and waterfall |
@@ -51,6 +53,25 @@ a few seconds).
 Levels are **uncalibrated** relative dB. The full-band view covers roughly
 2402 to 2482 MHz in 256 bins; zoomed views use larger on-chip FFTs on a single
 channel, down to about 39 kHz per bin.
+
+## Recording and raw samples
+
+Pressing **X** records every sweep to `App/MiYooSDR/rec/*.csv` (seconds, gain,
+then dB per bin). Zoom to one channel first and it records just that slice.
+
+For a controlled high-rate capture there is a headless mode:
+
+```sh
+App/MiYooSDR/miyoosdr --burst <MHz> <seconds>   # park on one channel, log power vs time
+```
+
+It stays on a single channel and records all 128 bins at about 25 sweeps per
+second, which is enough to see the timing of short transmissions.
+
+**There is no true raw IQ.** This chip exposes a power meter, not raw samples.
+The Realtek logic-analyzer / ADC-capture block that some of its siblings have is
+not wired up on the RTL8188FU (its enable register does not respond), so MiYooSDR
+records power against frequency and time, not a demodulatable sample stream.
 
 ## How it works
 

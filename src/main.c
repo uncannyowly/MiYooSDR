@@ -613,31 +613,65 @@ static void line(int x0, int y0, int x1, int y1, uint32_t c)
 
 static float db_low = 40.0f, enh_low = -8.0f;
 static int scaled, cursor = 128, show_hold = 1, enhance;
+static int spec_style = 1;      /* 0 line, 1 filled, 2 filled + Wi-Fi bands */
+static int palette;             /* index into palettes[] */
+static int sel_down, sel_combo; /* SELECT used as a shift layer */
 static uint8_t wf[WHGT][MAXBINS];
 static int wf_head, wf_rows;
 static uint32_t lut[256];
 
 static int bin_x(int i) { return PX0 + i * PW / vw.nb; }
 
+/* colour palettes: five {pos,r,g,b} stops each (0..1), shared by the filled
+ * spectrum and the waterfall */
+#define NPAL 4
+static const char *pal_name[NPAL] = { "Ember", "Spectrum", "Ice", "Matrix" };
+static const float palettes[NPAL][5][4] = {
+	{ {0.00f,0.03f,0.04f,0.10f},{0.30f,0.20f,0.05f,0.45f},{0.60f,0.85f,0.25f,0.30f},{0.85f,1.00f,0.65f,0.10f},{1.00f,1.00f,0.98f,0.75f} },
+	{ {0.00f,0.02f,0.02f,0.12f},{0.25f,0.00f,0.55f,0.90f},{0.50f,0.10f,0.85f,0.35f},{0.75f,0.95f,0.90f,0.10f},{1.00f,1.00f,0.15f,0.10f} },
+	{ {0.00f,0.02f,0.03f,0.07f},{0.35f,0.05f,0.20f,0.60f},{0.70f,0.20f,0.75f,0.95f},{0.90f,0.70f,0.95f,1.00f},{1.00f,1.00f,1.00f,1.00f} },
+	{ {0.00f,0.00f,0.03f,0.00f},{0.40f,0.00f,0.30f,0.05f},{0.75f,0.10f,0.85f,0.20f},{0.92f,0.60f,1.00f,0.50f},{1.00f,0.90f,1.00f,0.80f} },
+};
+
+static uint32_t rgbf(float r, float g, float b)
+{
+	int R = r < 0 ? 0 : r > 1 ? 255 : (int)(r * 255);
+	int G = g < 0 ? 0 : g > 1 ? 255 : (int)(g * 255);
+	int B = b < 0 ? 0 : b > 1 ? 255 : (int)(b * 255);
+	return (uint32_t)(R << 16 | G << 8 | B);
+}
+
+static uint32_t pal_color(float t) /* 0..1 through the active palette */
+{
+	const float (*st)[4] = palettes[palette];
+	int s = 0;
+	float u;
+	if (t < 0) t = 0;
+	if (t > 1) t = 1;
+	while (s < 3 && t > st[s + 1][0])
+		s++;
+	u = (t - st[s][0]) / (st[s + 1][0] - st[s][0]);
+	return rgbf(st[s][1] + u * (st[s + 1][1] - st[s][1]),
+	            st[s][2] + u * (st[s + 1][2] - st[s][2]),
+	            st[s][3] + u * (st[s + 1][3] - st[s][3]));
+}
+
 static void make_lut(void)
 {
-	/* dark blue -> purple -> orange -> pale yellow */
-	static const float stops[5][4] = {
-		{ 0.00f, 0.03f, 0.04f, 0.10f }, { 0.30f, 0.20f, 0.05f, 0.45f },
-		{ 0.60f, 0.85f, 0.25f, 0.30f }, { 0.85f, 1.00f, 0.65f, 0.10f },
-		{ 1.00f, 1.00f, 0.98f, 0.75f },
-	};
-	int i, s;
-	for (i = 0; i < 256; i++) {
-		float t = i / 255.0f;
-		for (s = 0; s < 3 && t > stops[s + 1][0]; s++)
-			;
-		float u = (t - stops[s][0]) / (stops[s + 1][0] - stops[s][0]);
-		int r = (int)(255 * (stops[s][1] + u * (stops[s + 1][1] - stops[s][1])));
-		int g = (int)(255 * (stops[s][2] + u * (stops[s + 1][2] - stops[s][2])));
-		int b = (int)(255 * (stops[s][3] + u * (stops[s + 1][3] - stops[s][3])));
-		lut[i] = (uint32_t)(r << 16 | g << 8 | b);
-	}
+	int i;
+	for (i = 0; i < 256; i++)
+		lut[i] = pal_color(i / 255.0f);
+}
+
+static uint32_t cscale(uint32_t c, float f) /* dim or brighten a colour */
+{
+	int r = (int)(((c >> 16) & 0xff) * f);
+	int g = (int)(((c >> 8) & 0xff) * f);
+	int b = (int)((c & 0xff) * f);
+	if (r > 255) r = 255;
+	if (g > 255) g = 255;
+	if (b > 255) b = 255;
+	return (uint32_t)(r << 16 | g << 8 | b);
 }
 
 /* what gets drawn: absolute dB, or dB above the background in enhance mode */
@@ -688,6 +722,52 @@ static FILE *rec;
 static char rec_name[160];
 static double rate;
 
+/* standard 2.4 GHz Wi-Fi channels shaded behind the spectrum in the bands view */
+static const int band_chs[3] = { 1, 6, 11 };
+static const uint32_t band_tint[3] = { 0x101d33, 0x10301c, 0x2f2710 };
+
+static void draw_band_tint(void)
+{
+	int c, i, y;
+	if (vw.level != 0)
+		return;
+	for (c = 0; c < 3; c++) {
+		int xa = PX0 + (int)((ch_mhz(band_chs[c]) - 11.0 - vw.f0) / vw.bw * PW / vw.nb);
+		int xb = PX0 + (int)((ch_mhz(band_chs[c]) + 11.0 - vw.f0) / vw.bw * PW / vw.nb);
+		if (xa < PX0) xa = PX0;
+		if (xb > PX0 + PW) xb = PX0 + PW;
+		for (y = SY0; y < SY0 + SHGT; y++)
+			for (i = xa; i < xb; i++)
+				canvas[y * SW + i] = band_tint[c];
+	}
+}
+
+/* filled multi-colour spectrum: a vertical gradient under each bin, brightest
+ * at the trace, with a lit top edge */
+static void draw_fill(const float *v)
+{
+	int i, bottom = SY0 + SHGT - 1, w = PW / vw.nb, k, y;
+	for (i = 0; i < vw.nb; i++) {
+		float frac = (shown(v, i) - low()) / DB_SPAN;
+		int yt;
+		uint32_t top, *dst;
+		if (frac < 0) frac = 0;
+		if (frac > 1) frac = 1;
+		yt = bottom - (int)(frac * (SHGT - 1));
+		top = pal_color(frac);
+		for (y = bottom; y >= yt; y--) {
+			float g = yt == bottom ? 1.0f : (float)(bottom - y) / (bottom - yt);
+			uint32_t col = cscale(top, 0.22f + 0.78f * g);
+			dst = canvas + y * SW + PX0 + i * w;
+			for (k = 0; k < w; k++)
+				dst[k] = col;
+		}
+		dst = canvas + yt * SW + PX0 + i * w;
+		for (k = 0; k < w; k++)
+			dst[k] = cscale(top, 1.4f);
+	}
+}
+
 static void render(void)
 {
 	char s[128];
@@ -696,6 +776,8 @@ static void render(void)
 
 	fill(0, 0, SW, SH, C_BG);
 	fill(PX0, SY0, PW, SHGT, C_PANEL);
+	if (spec_style == 2)
+		draw_band_tint();
 
 	/* title bar */
 	text(4, 2, C_TEXT, "MiYooSDR");
@@ -743,13 +825,22 @@ static void render(void)
 		text(PX0, SY0 + SHGT + 18, C_AXIS, s);
 	}
 
-	/* traces */
+	/* spectrum */
 	if (sweeps) {
+		if (spec_style == 0) {
+			for (i = 1; i < vw.nb; i++)
+				line(bin_x(i - 1), db_to_y(shown(sweep_db, i - 1)), bin_x(i), db_to_y(shown(sweep_db, i)), C_LIVE);
+		} else {
+			draw_fill(sweep_db);
+			for (i = 0; i <= 48; i += 12) { /* dotted dB lines back over the fill */
+				y = db_to_y(low() + i);
+				for (x = PX0; x < PX0 + PW; x += 4)
+					canvas[y * SW + x] = C_GRID;
+			}
+		}
 		if (have_hold && show_hold)
 			for (i = 1; i < vw.nb; i++)
 				line(bin_x(i - 1), db_to_y(shown(hold_db, i - 1)), bin_x(i), db_to_y(shown(hold_db, i)), C_HOLD);
-		for (i = 1; i < vw.nb; i++)
-			line(bin_x(i - 1), db_to_y(shown(sweep_db, i - 1)), bin_x(i), db_to_y(shown(sweep_db, i)), C_LIVE);
 	}
 
 	/* cursor */
@@ -768,6 +859,9 @@ static void render(void)
 		snprintf(s, sizeof(s), "bg %4.0f", base_db[cursor]);
 		text(PX0 + PW + 6, SY0 + 58, C_AVG, s);
 	}
+	snprintf(s, sizeof(s), "%s", spec_style == 0 ? "Line" : spec_style == 1 ? "Fill" : "Bands");
+	text(PX0 + PW + 6, SY0 + 82, C_DIM, s);
+	text(PX0 + PW + 6, SY0 + 98, C_DIM, pal_name[palette]);
 
 	/* waterfall, newest row on top */
 	for (y = 0; y < wf_rows; y++) {
@@ -786,10 +880,12 @@ static void render(void)
 	text(PX0 + PW + 6, WY0 + WHGT - 16, C_DIM, "older");
 
 	/* help / status line */
-	if (status_until > now_s())
+	if (sel_down)
+		text(4, SH - 17, C_ZOOM, "SELECT:  Y = view style   A = palette   (release to jump to peak)");
+	else if (status_until > now_s())
 		text(4, SH - 17, C_TEXT, status_msg);
 	else
-		text(4, SH - 17, C_DIM, "R2/L2 zoom SEL peak Y enhance A hold B clear X rec L1/R1 gain START shot");
+		text(4, SH - 17, C_DIM, "R2/L2 zoom  Dpad cursor  SEL peak (+Y style +A palette)  Y enh  A hold  B clr  X rec  START shot");
 }
 
 /* --------------------------------------------------------- output / input */
@@ -1032,11 +1128,28 @@ static void on_button(int code)
 		if (vw.level > 0)
 			set_view_zoom(fcur, vw.level - 1);
 		break;
-	case KEY_RIGHTCTRL: find_peak(); break; /* SELECT */
 	case KEY_ENTER: shot_req = 1; break;    /* START */
 	case KEY_ESC: quit = 1; break;          /* MENU */
 	}
 #endif
+}
+
+/* actions on the SELECT shift layer */
+static void sel_layer(int code)
+{
+	char m[48];
+	switch (code) {
+	case KEY_LEFTALT: /* SEL + Y: cycle spectrum style */
+		spec_style = (spec_style + 1) % 3;
+		status(spec_style == 0 ? "view: line" : spec_style == 1 ? "view: filled" : "view: filled + Wi-Fi bands");
+		break;
+	case KEY_SPACE: /* SEL + A: cycle palette */
+		palette = (palette + 1) % NPAL;
+		make_lut();
+		snprintf(m, sizeof(m), "palette: %s", pal_name[palette]);
+		status(m);
+		break;
+	}
 }
 
 static void poll_input(void)
@@ -1048,9 +1161,30 @@ static void poll_input(void)
 		return;
 	while ((n = read(in_fd, ev, sizeof(ev))) > 0) {
 		int k;
-		for (k = 0; k < (int)(n / sizeof(ev[0])); k++)
-			if (ev[k].type == EV_KEY && ev[k].value) /* press or autorepeat */
-				on_button(ev[k].code);
+		for (k = 0; k < (int)(n / sizeof(ev[0])); k++) {
+			int code = ev[k].code, val = ev[k].value;
+			if (ev[k].type != EV_KEY)
+				continue;
+			if (code == KEY_RIGHTCTRL) { /* SELECT: shift layer, or peak on a tap */
+				if (val == 1) {
+					sel_down = 1;
+					sel_combo = 0;
+				} else if (val == 0) {
+					sel_down = 0;
+					if (!sel_combo)
+						find_peak();
+				}
+				continue;
+			}
+			if (!val) /* ignore key releases for everything else */
+				continue;
+			if (sel_down) {
+				sel_layer(code);
+				sel_combo = 1;
+			} else {
+				on_button(code);
+			}
+		}
 	}
 #endif
 }
@@ -1075,8 +1209,8 @@ static void print_row(const char *tag, const float *v)
 int main(int argc, char **argv)
 {
 	const char *shot = NULL;
-	int dump = 0, probe = 0, i, shot_after = 12, zlevel = 0;
-	double t0, last_rate_t, last_flush, last_diag = 0, zf = 0;
+	int dump = 0, probe = 0, racap = 0, burst_sec = 0, i, shot_after = 12, zlevel = 0;
+	double t0, last_rate_t, last_flush, last_diag = 0, zf = 0, burst_mhz = 0;
 	long last_sweeps = 0;
 	struct sigaction sa;
 
@@ -1094,6 +1228,15 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--zoom") && i + 2 < argc) {
 			zf = atof(argv[++i]);
 			zlevel = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--burst") && i + 2 < argc) {
+			burst_mhz = atof(argv[++i]);
+			burst_sec = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--racap")) {
+			racap = 1;
+		} else if (!strcmp(argv[i], "--style") && i + 1 < argc) {
+			spec_style = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--pal") && i + 1 < argc) {
+			palette = atoi(argv[++i]);
 		} else if (!strcmp(argv[i], "--pm-active")) {
 			pm_active();
 			return 0;
@@ -1117,6 +1260,85 @@ int main(int argc, char **argv)
 		cursor = (int)((zf - vw.f0) / vw.bw);
 	}
 
+	if (burst_sec) { /* single-channel high-rate power-vs-time recorder */
+		int ch = (int)lround((burst_mhz - 2407.0) / 5.0), k;
+		double f0, t0b, tnow;
+		long nrows = 0;
+		char name[160];
+		time_t tt;
+		struct tm tm;
+		FILE *f;
+		if (ch < 1) ch = 1;
+		if (ch > 13) ch = 13;
+		f0 = ch_mhz(ch) - 64 * 0.3125;
+		mkdir("rec", 0755);
+		tt = time(NULL);
+		localtime_r(&tt, &tm);
+		snprintf(name, sizeof(name), "rec/burst-%04d%02d%02d-%02d%02d%02d.csv", tm.tm_year + 1900, tm.tm_mon + 1,
+		         tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+		f = fopen(name, "w");
+		if (!f) {
+			fprintf(stderr, "cannot open %s\n", name);
+			radio_restore();
+			return 4;
+		}
+		fprintf(f, "# MiYooSDR burst capture: channel %d, bin i = %.4f + 0.3125*i MHz, 128 bins, 128-pt FFT\n", ch, f0);
+		fprintf(f, "# columns: seconds, gain(IGI), then dB*10 per bin (uncalibrated)\n");
+		set_igi(igi);
+		tune(ch);
+		(void)psd_point(0, 0);
+		t0b = now_s();
+		while ((tnow = now_s()) - t0b < burst_sec && !quit && !radio_dead) {
+			fprintf(f, "%.4f,%d", tnow - t0b, igi);
+			for (k = -64; k < 64; k++) {
+				unsigned v = psd_point(k, 0);
+				double db = v ? 10.0 * log10((double)v) + igi : 0;
+				fprintf(f, ",%d", (int)lrint(db * 10));
+			}
+			fputc('\n', f);
+			nrows++;
+		}
+		fclose(f);
+		sync();
+		fprintf(stderr, "burst: %ld sweeps in %.1f s (%.0f/s) on ch %d (%.1f MHz) -> %s\n", nrows, now_s() - t0b,
+		        nrows / (now_s() - t0b), ch, ch_mhz(ch), name);
+		radio_restore();
+		return 0;
+	}
+	if (racap) { /* feasibility probe: can we read a sample buffer, does the LA block respond? */
+		unsigned old106, old7c0, old9a0, base, first = 0, w0, w1;
+		int k, varied = 0;
+		printf("racap feasibility probe (read-biased, restores afterwards)\n");
+		printf("LA/MAC regs: 0x7c0=%08x 0x7cc=%08x 0x9a0=%08x 0x808=%08x\n",
+		       reg_read32(0x7c0), reg_read32(0x7cc), reg_read32(0x9a0), reg_read32(0x808));
+		old106 = reg_read32(0x106) & 0xff;
+		reg_write(0x106, 0x69, 1); /* enable packet-buffer access (as dump_TX_FIFO does) */
+		base = reg_read32(0x209) & 0xff;
+		printf("packet-buffer access: 0x106 %x->69, base page 0x209=%x; words at 0x144/0x148:\n", old106, base);
+		for (k = 0; k < 12; k++) {
+			reg_write(0x140, (unsigned)k, 4);
+			w0 = reg_read32(0x144);
+			w1 = reg_read32(0x148);
+			printf("  [%2d] %08x %08x\n", k, w0, w1);
+			if (k == 0)
+				first = w0;
+			else if (w0 != first)
+				varied = 1;
+		}
+		reg_write(0x106, old106, 1);
+		printf("=> packet-buffer readback %s\n", varied ? "VARIES (mechanism responds)" : "constant (no usable readback)");
+		old7c0 = reg_read32(0x7c0);
+		old9a0 = reg_read32(0x9a0);
+		reg_write(0x7c0, (old7c0 & ~0xffu) | 0x1u, 4); /* try to enable the LA block */
+		w0 = reg_read32(0x7c0);
+		printf("=> LA enable test: wrote 0x7c0 bit0=1, reads %08x (bit0=%u) %s\n", w0, w0 & 1u,
+		       (w0 & 1u) ? "-> LA block accepts enable" : "-> enable did not stick, LA likely absent");
+		reg_write(0x7c0, old7c0, 4);
+		reg_write(0x9a0, old9a0, 4);
+		printf("restored: 0x7c0=%08x 0x9a0=%08x, ioerr %ld\n", reg_read32(0x7c0), reg_read32(0x9a0), io_errors);
+		radio_restore();
+		return 0;
+	}
 	if (probe) { /* per FFT size: is a read W us after the trigger still the old result? */
 		static const int waits[6] = { 100, 200, 400, 800, 1600, 3200 };
 		int sz, w, r;
