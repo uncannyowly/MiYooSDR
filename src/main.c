@@ -571,6 +571,7 @@ static double status_until;
 static void poll_input(void);
 static void status(const char *msg);
 static void update_occupancy(void);
+static void burst_reset(void);
 
 static float to_db(unsigned v, float prev)
 {
@@ -682,6 +683,8 @@ static void do_sweep(void)
 		frozen = distinct_count(raw_v, vw.nb) <= 3;
 	}
 	check_stuck(frozen);
+	if (fake) /* about the Mini's sweep rates, so timing on the PC looks like the real thing */
+		usleep(vw.level ? 50000 : 200000);
 
 	for (j = 0; j < vw.nb; j++) {
 		float s = sweep_db[j];
@@ -888,6 +891,7 @@ static void reset_traces(void)
 	have_hold = have_avg = have_base = 0;
 	wf_rows = 0;
 	scaled = 0;
+	burst_reset();
 }
 
 static FILE *rec;
@@ -1004,6 +1008,113 @@ static void draw_occupancy(void)
 	text(PX0 + PW - (int)strlen(s) * 8, WY0, vw.level ? C_DIM : C_LIVE, s);
 }
 
+/* what uses frequency f (MHz): Bluetooth LE (40 channels 2 MHz apart from 2402; 37, 38
+ * and 39 are the advertising channels that beacons and most remotes use), Wi-Fi
+ * (channels 1-13, 20 MHz wide) and Zigbee / 802.15.4 (channels 11-26, 2 MHz wide) */
+static int ble_channel(double f, int *adv)
+{
+	int rf = (int)lround((f - 2402.0) / 2.0), idx;
+	if (rf < 0 || rf > 39 || fabs(f - (2402.0 + 2.0 * rf)) > 1.0)
+		return -1;
+	idx = rf == 0 ? 37 : rf == 12 ? 38 : rf == 39 ? 39 : rf < 12 ? rf - 1 : rf - 2;
+	*adv = idx >= 37;
+	return idx;
+}
+
+static int wifi_channel(double f)
+{
+	int ch = (int)lround((f - 2407.0) / 5.0);
+	if (ch < 1) ch = 1;
+	if (ch > 13) ch = 13;
+	return fabs(f - ch_mhz(ch)) <= 10.0 ? ch : -1;
+}
+
+static int zigbee_channel(double f)
+{
+	int k = (int)lround((f - 2405.0) / 5.0) + 11;
+	return k >= 11 && k <= 26 && fabs(f - (2405.0 + 5.0 * (k - 11))) <= 1.5 ? k : -1;
+}
+
+/* bursts at the cursor: the level rises 8 dB over the background, then falls back
+ * under 5 dB. Counts them, with the time since the last one, the typical spacing
+ * and the last one's length; time resolution is one sweep */
+#define BURST_ON 8.0f
+#define BURST_OFF 5.0f
+static struct {
+	int on, cursor, level;
+	long count;
+	double last_start, last_len, interval;
+} bst;
+static int in_review;
+
+static void burst_reset(void)
+{
+	memset(&bst, 0, sizeof(bst));
+	bst.cursor = cursor;
+	bst.level = vw.level;
+}
+
+static void burst_update(double t)
+{
+	float e = -1e9f;
+	int i;
+	if (!have_base)
+		return;
+	if (bst.cursor != cursor || bst.level != vw.level)
+		burst_reset();
+	for (i = cursor - 1; i <= cursor + 1; i++) /* the cursor's bin and its neighbours */
+		if (i >= 0 && i < vw.nb && sweep_db[i] - base_db[i] > e)
+			e = sweep_db[i] - base_db[i];
+	if (!bst.on && e > BURST_ON) {
+		bst.on = 1;
+		if (bst.count) {
+			double iv = t - bst.last_start;
+			bst.interval = bst.count > 1 ? 0.7 * bst.interval + 0.3 * iv : iv;
+		}
+		bst.last_start = t;
+		bst.count++;
+	} else if (bst.on && e < BURST_OFF) {
+		bst.on = 0;
+		bst.last_len = t - bst.last_start;
+	}
+}
+
+static void fmt_secs(char *s, size_t n, double v)
+{
+	if (v < 1.0)
+		snprintf(s, n, "%.0fms", v * 1000);
+	else
+		snprintf(s, n, v < 100 ? "%.1fs" : "%.0fs", v);
+}
+
+/* the column right of the lower panel */
+static void draw_bursts(void)
+{
+	int x = PX0 + PW + 6, y = WY0 + 26;
+	char s[16];
+	text(x, y, C_DIM, "BURSTS");
+	snprintf(s, sizeof(s), "%ld", bst.count);
+	text(x, y + 16, bst.on ? C_LIVE : C_TEXT, s);
+	text(x, y + 40, C_DIM, "last");
+	if (bst.count)
+		fmt_secs(s, sizeof(s), now_s() - bst.last_start);
+	else
+		snprintf(s, sizeof(s), "-");
+	text(x, y + 56, C_TEXT, s);
+	text(x, y + 80, C_DIM, "every");
+	if (bst.count > 1)
+		fmt_secs(s, sizeof(s), bst.interval);
+	else
+		snprintf(s, sizeof(s), "-");
+	text(x, y + 96, C_TEXT, s);
+	text(x, y + 120, C_DIM, "length");
+	if (bst.last_len > 0)
+		fmt_secs(s, sizeof(s), bst.last_len);
+	else
+		snprintf(s, sizeof(s), "-");
+	text(x, y + 136, C_TEXT, s);
+}
+
 static void render(void)
 {
 	char s[128];
@@ -1081,6 +1192,19 @@ static void render(void)
 				line(bin_x(i - 1), db_to_y(shown(hold_db, i - 1)), bin_x(i), db_to_y(shown(hold_db, i)), C_HOLD);
 	}
 
+	/* Bluetooth LE advertising channels 37/38/39: ticks on the bottom edge */
+	{
+		static const double adv_mhz[3] = { 2402.0, 2426.0, 2480.0 };
+		for (i = 0; i < 3; i++) {
+			if (adv_mhz[i] < vw.f0 || adv_mhz[i] >= vw.f0 + span)
+				continue;
+			x = PX0 + (int)((adv_mhz[i] - vw.f0) / vw.bw * PW / vw.nb);
+			fill(x - 1, SY0 + SHGT - 7, 3, 7, C_HOLD);
+			if (vw.level == 0)
+				text(x - 12, SY0 + SHGT + 18, cscale(C_HOLD, 0.7f), "adv");
+		}
+	}
+
 	/* cursor */
 	if (cursor >= vw.nb)
 		cursor = vw.nb - 1;
@@ -1101,6 +1225,26 @@ static void render(void)
 	text(PX0 + PW + 6, SY0 + 82, C_DIM, s);
 	text(PX0 + PW + 6, SY0 + 98, C_DIM, pal_name[palette]);
 
+	/* what the cursor frequency is used for */
+	{
+		double fc = vw.f0 + (cursor + 0.5) * vw.bw;
+		int adv = 0, b = ble_channel(fc, &adv), w = wifi_channel(fc), z = zigbee_channel(fc), yy = SY0 + 122;
+		if (b >= 0) {
+			snprintf(s, sizeof(s), adv ? "ADV %d" : "BLE %d", b);
+			text(PX0 + PW + 6, yy, adv ? C_HOLD : C_TEXT, s);
+			yy += 16;
+		}
+		if (w > 0) {
+			snprintf(s, sizeof(s), "WiFi %d", w);
+			text(PX0 + PW + 6, yy, C_TEXT, s);
+			yy += 16;
+		}
+		if (z > 0) {
+			snprintf(s, sizeof(s), "ZB %d", z);
+			text(PX0 + PW + 6, yy, C_TEXT, s);
+		}
+	}
+
 	/* lower panel: waterfall (newest on top) or channel occupancy */
 	if (disp_mode == 1) {
 		draw_occupancy();
@@ -1120,14 +1264,16 @@ static void render(void)
 		text(PX0 + PW + 6, WY0, C_DIM, "newest");
 		text(PX0 + PW + 6, WY0 + WHGT - 16, C_DIM, "older");
 	}
+	if (!in_review)
+		draw_bursts();
 
-	/* help / status line */
+	/* help / status line (80 characters fit) */
 	if (sel_down)
-		text(4, SH - 17, C_ZOOM, "SELECT:  Y = view style   A = palette   (release to jump to peak)");
+		text(4, SH - 17, C_ZOOM, "SELECT +  Y style  A palette  B occupancy  X sound  START review  (tap: peak)");
 	else if (status_until > now_s())
 		text(4, SH - 17, C_TEXT, status_msg);
 	else
-		text(4, SH - 17, C_DIM, "R2/L2 zoom  Dpad cursor  SEL peak (+Y style +A palette)  Y enh  A hold  B clr  X rec  START shot");
+		text(4, SH - 17, C_DIM, "R2/L2 zoom  SEL peak  Y enhance  A hold  B clear  X rec  L1/R1 gain  START png");
 }
 
 /* --------------------------------------------------------- output / input */
@@ -1225,6 +1371,180 @@ static int write_ppm(const char *path)
 	}
 	fclose(f);
 	return 0;
+}
+
+/* PNG with stored (uncompressed) deflate blocks: opens on any phone or PC, no zlib */
+static uint32_t crc_tab[256];
+
+static uint32_t crc32_update(uint32_t c, const uint8_t *p, size_t n)
+{
+	size_t i;
+	if (!crc_tab[1]) {
+		uint32_t k, v;
+		int b;
+		for (k = 0; k < 256; k++) {
+			v = k;
+			for (b = 0; b < 8; b++)
+				v = (v & 1) ? 0xEDB88320u ^ (v >> 1) : v >> 1;
+			crc_tab[k] = v;
+		}
+	}
+	for (i = 0; i < n; i++)
+		c = crc_tab[(c ^ p[i]) & 0xff] ^ (c >> 8);
+	return c;
+}
+
+static void put_be32(uint8_t *b, uint32_t v)
+{
+	b[0] = (uint8_t)(v >> 24);
+	b[1] = (uint8_t)(v >> 16);
+	b[2] = (uint8_t)(v >> 8);
+	b[3] = (uint8_t)v;
+}
+
+static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t len)
+{
+	uint8_t b[4];
+	uint32_t c;
+	put_be32(b, len);
+	fwrite(b, 1, 4, f);
+	fwrite(type, 1, 4, f);
+	if (len)
+		fwrite(data, 1, len, f);
+	c = crc32_update(0xFFFFFFFFu, (const uint8_t *)type, 4);
+	c = crc32_update(c, data, len) ^ 0xFFFFFFFFu;
+	put_be32(b, c);
+	fwrite(b, 1, 4, f);
+}
+
+static int write_png(const char *path)
+{
+	static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+	const uint32_t row = 1 + SW * 3, raw = row * SH, nblk = (raw + 65534) / 65535;
+	uint8_t *rb = malloc(raw), *z = malloc(2 + raw + 5 * nblk + 4), *p, ihdr[13];
+	uint32_t a = 1, b = 0, done = 0, i;
+	int x, y, ok = -1;
+	FILE *f;
+
+	if (!rb || !z)
+		goto out;
+	for (y = 0; y < SH; y++) {
+		uint8_t *r = rb + (size_t)y * row;
+		*r++ = 0; /* filter: none */
+		for (x = 0; x < SW; x++) {
+			uint32_t c = canvas[y * SW + x];
+			*r++ = (uint8_t)(c >> 16);
+			*r++ = (uint8_t)(c >> 8);
+			*r++ = (uint8_t)c;
+		}
+	}
+	for (i = 0; i < raw; i++) { /* zlib's Adler-32 */
+		a = (a + rb[i]) % 65521;
+		b = (b + a) % 65521;
+	}
+	p = z;
+	*p++ = 0x78; /* zlib header: deflate, 32 KB window */
+	*p++ = 0x01;
+	while (done < raw) {
+		uint32_t n = raw - done > 65535 ? 65535 : raw - done;
+		*p++ = (uint8_t)(done + n == raw); /* BFINAL, BTYPE 00 (stored) */
+		*p++ = (uint8_t)n;
+		*p++ = (uint8_t)(n >> 8);
+		*p++ = (uint8_t)~n;
+		*p++ = (uint8_t)(~n >> 8);
+		memcpy(p, rb + done, n);
+		p += n;
+		done += n;
+	}
+	put_be32(p, b << 16 | a);
+	p += 4;
+	f = fopen(path, "wb");
+	if (!f)
+		goto out;
+	put_be32(ihdr, SW);
+	put_be32(ihdr + 4, SH);
+	ihdr[8] = 8;  /* bits per channel */
+	ihdr[9] = 2;  /* RGB */
+	ihdr[10] = ihdr[11] = ihdr[12] = 0;
+	fwrite(sig, 1, 8, f);
+	png_chunk(f, "IHDR", ihdr, 13);
+	png_chunk(f, "IDAT", z, (uint32_t)(p - z));
+	png_chunk(f, "IEND", NULL, 0);
+	ok = fclose(f) == 0 ? 0 : -1;
+out:
+	free(rb);
+	free(z);
+	return ok;
+}
+
+static int write_image(const char *path)
+{
+	size_t l = strlen(path);
+	return l > 4 && !strcmp(path + l - 4, ".png") ? write_png(path) : write_ppm(path);
+}
+
+static void status(const char *msg);
+
+/* START: shots/sdr-YYYYMMDD-HHMMSS.png, so screenshots do not overwrite each other */
+static void save_screenshot(void)
+{
+	char name[96], m[128];
+	time_t t = time(NULL);
+	struct tm tm;
+	localtime_r(&t, &tm);
+	mkdir("shots", 0755);
+	snprintf(name, sizeof(name), "shots/sdr-%04d%02d%02d-%02d%02d%02d.png", tm.tm_year + 1900, tm.tm_mon + 1,
+	         tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+	if (write_png(name) == 0) {
+		sync();
+		snprintf(m, sizeof(m), "screenshot saved: %s", name);
+		status(m);
+	} else {
+		status("cannot write the screenshot");
+	}
+}
+
+/* settings.txt next to the app: the view you left, restored on the next plain start
+ * (started with options, as in tests, it is neither read nor written) */
+static void settings_save(void)
+{
+	FILE *f = fopen("settings.txt", "w");
+	if (!f)
+		return;
+	fprintf(f, "# MiYooSDR settings, written on exit\n");
+	fprintf(f, "palette=%d\nstyle=%d\npanel=%d\nenhance=%d\nhold=%d\n", palette, spec_style, disp_mode, enhance,
+	        show_hold);
+	fprintf(f, "zoom=%d\nzoom_mhz=%.4f\ncursor_mhz=%.4f\n", vw.level, vw.f0 + vw.nb * vw.bw / 2,
+	        vw.f0 + (cursor + 0.5) * vw.bw);
+	fclose(f);
+	sync();
+}
+
+static void settings_load(void)
+{
+	FILE *f = fopen("settings.txt", "r");
+	char line[96], key[32];
+	int zoom = 0;
+	double v, zoom_mhz = 0, cursor_mhz = 0;
+	if (!f)
+		return;
+	while (fgets(line, sizeof(line), f)) {
+		if (sscanf(line, "%31[a-z_]=%lf", key, &v) != 2)
+			continue;
+		if (!strcmp(key, "palette") && v >= 0 && v < NPAL) palette = (int)v;
+		else if (!strcmp(key, "style") && v >= 0 && v <= 2) spec_style = (int)v;
+		else if (!strcmp(key, "panel")) disp_mode = v != 0;
+		else if (!strcmp(key, "enhance")) enhance = v != 0;
+		else if (!strcmp(key, "hold")) show_hold = v != 0;
+		else if (!strcmp(key, "zoom") && v >= 0 && v <= 3) zoom = (int)v;
+		else if (!strcmp(key, "zoom_mhz")) zoom_mhz = v;
+		else if (!strcmp(key, "cursor_mhz")) cursor_mhz = v;
+	}
+	fclose(f);
+	if (zoom && zoom_mhz > 2395 && zoom_mhz < 2490)
+		view_zoom(zoom_mhz, zoom);
+	if (cursor_mhz > vw.f0 && cursor_mhz < vw.f0 + vw.nb * vw.bw)
+		cursor = (int)((cursor_mhz - vw.f0) / vw.bw);
 }
 
 static void status(const char *msg)
@@ -1469,6 +1789,7 @@ static void review_play(const char *path)
 	double f0 = 2402.0, bw = 0.3125, pos = 0, speed = 1.0, last, rowdt;
 	int nb = 0, leading = 2, lvl = 0, nrows = 0, cap = 0, i, playing = 1, back = 0;
 	int save_mode = disp_mode, save_cursor = cursor;
+	struct view save_vw = vw; /* the recording's view replaces the live one meanwhile */
 	float *data = NULL, mn[MAXBINS], mx[MAXBINS];
 	double *ts = NULL;
 
@@ -1528,6 +1849,7 @@ static void review_play(const char *path)
 	rowdt = (ts[nrows - 1] - ts[0]) / nrows + 1e-6;
 	snprintf(review_name, sizeof(review_name), "%s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
 	last = now_s();
+	in_review = 1;
 
 	while (!quit && !back) {
 		double t = now_s();
@@ -1579,8 +1901,10 @@ static void review_play(const char *path)
 #endif
 		usleep(15000);
 	}
+	in_review = 0;
 	disp_mode = save_mode;
 	cursor = save_cursor;
+	vw = save_vw; /* back to the live view (a zoomed recording left channel 0 behind) */
 	free(data);
 	free(ts);
 	reset_traces();
@@ -1671,7 +1995,7 @@ static void print_row(const char *tag, const float *v)
 int main(int argc, char **argv)
 {
 	const char *shot = NULL;
-	int dump = 0, probe = 0, racap = 0, burst_sec = 0, i, shot_after = 12, zlevel = 0;
+	int dump = 0, probe = 0, racap = 0, burst_sec = 0, i, shot_after = 12, zlevel = 0, use_settings = argc == 1;
 	double t0, last_rate_t, last_flush, last_diag = 0, zf = 0, burst_mhz = 0;
 	long last_sweeps = 0;
 	struct sigaction sa;
@@ -1701,6 +2025,10 @@ int main(int argc, char **argv)
 			palette = atoi(argv[++i]);
 		} else if (!strcmp(argv[i], "--occ")) {
 			disp_mode = 1;
+		} else if (!strcmp(argv[i], "--shot-after") && i + 1 < argc) {
+			shot_after = atoi(argv[++i]);
+		} else if (!strcmp(argv[i], "--settings")) { /* tests: use settings.txt with options too */
+			use_settings = 1;
 		} else if (!strcmp(argv[i], "--pm-active")) {
 			pm_active();
 			return 0;
@@ -1717,8 +2045,10 @@ int main(int argc, char **argv)
 		return 2;
 	if (!fake)
 		igi = (int)(orig_c50 & 0x7f);
-	make_lut();
 	view_full();
+	if (use_settings) /* a plain start (from Onion): the view you left last time */
+		settings_load();
+	make_lut();
 	if (zlevel) {
 		view_zoom(zf, zlevel);
 		cursor = (int)((zf - vw.f0) / vw.bw);
@@ -1876,6 +2206,7 @@ int main(int argc, char **argv)
 			autoscale();
 		push_waterfall();
 		record_sweep(t0);
+		burst_update(now_s());
 		if (now_s() - last_rate_t >= 1.0) {
 			rate = (sweeps - last_sweeps) / (now_s() - last_rate_t);
 			last_sweeps = sweeps;
@@ -1888,19 +2219,21 @@ int main(int argc, char **argv)
 		render();
 		if (shot) {
 			if (sweeps >= shot_after) {
-				write_ppm(shot);
+				write_image(shot);
 				break;
 			}
 			continue;
 		}
 		present();
-		if (shot_req || sweeps == 20) { /* one automatic screenshot for checking the layout */
-			write_ppm(shot_req ? "screenshot.ppm" : "first.ppm");
-			if (shot_req)
-				status("screenshot saved");
+		if (shot_req) {
+			save_screenshot();
 			shot_req = 0;
+		} else if (sweeps == 20) { /* one automatic screenshot for checking the layout */
+			write_ppm("first.ppm");
 		}
 	}
+	if (use_settings)
+		settings_save();
 
 	if (rec)
 		fclose(rec);

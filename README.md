@@ -19,6 +19,9 @@ Besides the live spectrum and waterfall it also has a **channel occupancy** view
 (per Wi-Fi-channel activity bars, to find a clear channel), **signal-to-sound**
 (a tone that rises as you move the cursor onto a signal, handy for direction
 finding), and a **review** mode that replays saved recordings on the handheld.
+It names what uses the frequency under the cursor (Bluetooth LE, Wi-Fi, Zigbee),
+counts the **bursts** there (how often a remote or sensor transmits, and for how
+long), and remembers your view between launches.
 
 ![MiYooSDR showing a 2.4 GHz spectrum and waterfall](docs/screenshot.png)
 
@@ -51,16 +54,33 @@ a few seconds).
 | SELECT + START | Open the recording browser to replay a saved capture |
 | Y | Enhance: show dB above the slow background instead of absolute level |
 | A | Show or hide the max-hold trace |
-| B | Clear the hold, average and waterfall |
+| B | Clear the hold, average, waterfall and burst count |
 | X | Start / stop recording to `App/MiYooSDR/rec/*.csv` |
 | L1 / R1 | Gain down / up |
 | D-pad Up / Down | Shift the level range |
-| START | Save a screenshot (`screenshot.ppm`) |
+| START | Save a screenshot (`App/MiYooSDR/shots/sdr-<date>-<time>.png`) |
 | MENU | Quit |
 
 Levels are **uncalibrated** relative dB. The full-band view covers roughly
 2402 to 2482 MHz in 256 bins; zoomed views use larger on-chip FFTs on a single
 channel, down to about 39 kHz per bin.
+
+## Reading the screen
+
+- **Right of the spectrum:** the cursor frequency, its level now, its max hold and
+  the background, then what uses that frequency: the Bluetooth LE channel (`ADV 37`,
+  `ADV 38` and `ADV 39` in yellow are the advertising channels that beacons, phones
+  and most BLE remotes use), the Wi-Fi channel and the Zigbee / 802.15.4 channel.
+  Yellow ticks on the spectrum's bottom edge mark the three advertising channels.
+- **Right of the waterfall:** **BURSTS** counts transmissions at the cursor: the
+  level rising 8 dB over the background and falling back. Below it are the time
+  since the last burst, the typical spacing between bursts and the last one's
+  length. Park the cursor on a signal (SELECT jumps to the strongest) and zoom in
+  for finer timing: a full-band sweep takes about 0.2 s, a zoomed one 0.05 to
+  0.15 s. B clears the count, and moving the cursor starts a new one.
+- **Remembered:** palette, view style, lower panel, enhance, max hold, zoom and the
+  cursor are saved to `App/MiYooSDR/settings.txt` when you quit and restored on the
+  next start. Delete the file to start fresh.
 
 ## Recording and raw samples
 
@@ -109,10 +129,13 @@ For a desktop build with a synthetic radio, to work on the UI without hardware:
 ```sh
 make host
 build/host/miyoosdr --fake            # fake spectrum, runs on /dev/fb0 if present
-build/host/miyoosdr --fake --shot out.ppm   # render one frame and exit
+build/host/miyoosdr --fake --shot out.png   # render one frame (.png or .ppm) and exit
 ```
 
-Other modes: `--dump N` (N sweeps as text), `--probe` (PSD timing), `--zoom MHZ LEVEL`.
+Other modes: `--dump N` (N sweeps as text), `--probe` (PSD timing), `--zoom MHZ LEVEL`,
+`--shot-after N` (sweeps before `--shot` renders, default 12), `--settings` (read and
+write `settings.txt` even when started with options). The fake radio sweeps at about
+the Mini's rate, so burst timing looks like the real thing.
 
 ## Credits and license
 

@@ -3,3 +3,5 @@ build/
 app/MiYooSDR/miyoosdr
 app/MiYooSDR/rec/
 dist/
+app/MiYooSDR/shots/
+app/MiYooSDR/settings.txt
