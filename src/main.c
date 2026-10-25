@@ -45,6 +45,7 @@
 #endif
 
 #include "font.h"
+#include "pcap.h"
 
 #define PROC "/proc/net/rtl8188fu/wlan0/"
 #define MAXBINS 256
@@ -1777,6 +1778,194 @@ static void on_signal(int sig)
 }
 
 /* ----------------------------------------------------------- review mode */
+/* Packet playback uses capture timestamps and metadata, rather than inventing
+ * a spectrum from decoded frames. It also works without opening the radio. */
+#define PACKET_X 24
+#define PACKET_W 592
+
+static size_t packet_at_time(const struct packet_capture *capture, double pos)
+{
+	size_t lo = 0, hi = capture->count;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (capture->packets[mid].time <= pos) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo ? lo - 1 : 0;
+}
+
+static void packet_signal(const struct packet_record *packet, char *out, size_t size)
+{
+	if (packet->signal == 32767) snprintf(out, size, "---");
+	else snprintf(out, size, "%d%s", packet->signal, packet->signal == 0 ? "?" : "");
+}
+
+static void packet_rate(const struct packet_record *packet, char *out, size_t size)
+{
+	if (packet->mcs != 255) snprintf(out, size, "MCS %u", packet->mcs);
+	else if (packet->rate_half) snprintf(out, size, "%g%s Mb/s", packet->rate_half / 2.0,
+	                                  packet->rate_half == 93 ? "?" : "");
+	else snprintf(out, size, "---");
+}
+
+static void packet_address(const uint8_t *address, int valid, char *out, size_t size)
+{
+	if (!valid) snprintf(out, size, "---");
+	else snprintf(out, size, "%02x:%02x:%02x:%02x:%02x:%02x", address[0], address[1], address[2],
+	              address[3], address[4], address[5]);
+}
+
+static void packet_render(const struct packet_capture *capture, const char *path, size_t selected,
+                          double pos, double speed, int playing,
+                          unsigned bins[3][PACKET_W], unsigned peak)
+{
+	const struct packet_record *packet = &capture->packets[selected];
+	static const uint32_t colours[3] = { C_LIVE, C_AVG, C_HOLD };
+	char s[256], signal[24], rate_text[32], tx[24], rx[24], channel[32], sequence[16];
+	const char *name = strrchr(path, '/');
+	size_t first = selected > 3 ? selected - 3 : 0, r;
+	int x, category;
+	fill(0, 0, SW, SH, C_BG);
+	text(12, 6, C_ZOOM, "PACKET REPLAY");
+	snprintf(s, sizeof(s), "%.3f / %.3f s  x%g  %s", pos, capture->duration, speed,
+	         playing ? "PLAY" : pos >= capture->duration ? "END" : "PAUSE");
+	text(200, 6, playing ? C_LIVE : C_TEXT, s);
+	snprintf(s, sizeof(s), "%.76s", name ? name + 1 : path);
+	text(12, 26, C_DIM, s);
+	text(24, 48, C_TEXT, "TRAFFIC: packets / time bin");
+	text(376, 48, C_LIVE, "MGMT"); text(440, 48, C_AVG, "CTRL"); text(504, 48, C_HOLD, "DATA");
+	fill(PACKET_X, 68, PACKET_W, 78, C_PANEL);
+	for (x = 0; x < PACKET_W; x++) {
+		int y = 145;
+		unsigned cumulative = 0;
+		for (category = 0; category < 3; category++) {
+			int height;
+			cumulative += bins[category][x];
+			height = peak ? (int)(cumulative * 76.0 / peak) : 0;
+			if (height) line(PACKET_X + x, y, PACKET_X + x, 145 - height, colours[category]);
+			y = 145 - height;
+		}
+	}
+	x = capture->duration > 0 ? (int)(pos / capture->duration * (PACKET_W - 1)) : 0;
+	line(PACKET_X + x, 66, PACKET_X + x, 147, C_CURSOR);
+	snprintf(s, sizeof(s), "0 s       peak %u/bin; bin %.2f ms", peak,
+	         capture->duration * 1000 / PACKET_W);
+	text(24, 150, C_DIM, s);
+	snprintf(s, sizeof(s), "%.3f s", capture->duration); text(536, 150, C_DIM, s);
+	snprintf(s, sizeof(s), "Frame %zu/%zu   %s   %u bytes", selected + 1, capture->count,
+	         packet_type_name(packet), packet->length);
+	text(24, 176, C_TEXT, s);
+	packet_signal(packet, signal, sizeof(signal));
+	packet_rate(packet, rate_text, sizeof(rate_text));
+	if (packet->frequency) snprintf(channel, sizeof(channel), "%u MHz", packet->frequency);
+	else snprintf(channel, sizeof(channel), "---");
+	snprintf(s, sizeof(s), "%s   Signal %s dBm   Rate %s", channel, signal, rate_text);
+	text(24, 196, C_AVG, s);
+	packet_address(packet->transmitter, packet->has_transmitter, tx, sizeof(tx));
+	packet_address(packet->receiver, packet->has_receiver, rx, sizeof(rx));
+	snprintf(s, sizeof(s), "TX %s   RX %s", tx, rx); text(24, 216, C_DIM, s);
+	if (packet->sequence != 65535) snprintf(sequence, sizeof(sequence), "%u", packet->sequence);
+	else snprintf(sequence, sizeof(sequence), "---");
+	snprintf(s, sizeof(s), "Seq %s   %s%s%s", sequence, packet->protected_frame ? "PROTECTED  " : "",
+	         packet->retry ? "RETRY  " : "", packet->bad_fcs ? "BAD FCS" : "");
+	text(24, 236, packet->bad_fcs ? C_REC : C_DIM, s);
+	text(24, 262, C_DIM, " TIME (s)  FRAME TYPE       BYTES    SIGNAL   RATE");
+	if (first + 7 > capture->count) first = capture->count > 7 ? capture->count - 7 : 0;
+	for (r = first; r < capture->count && r < first + 7; r++) {
+		int y = 282 + (int)(r - first) * 20;
+		const struct packet_record *p = &capture->packets[r];
+		packet_signal(p, signal, sizeof(signal)); packet_rate(p, rate_text, sizeof(rate_text));
+		if (r == selected) fill(16, y - 1, 608, 19, C_PANEL);
+		snprintf(s, sizeof(s), "%9.4f  %-15.15s %5u  %7s   %s", p->time, packet_type_name(p),
+		         p->length, signal, rate_text);
+		text(24, y, r == selected ? C_LIVE : C_DIM, s);
+	}
+	if (capture->limited || capture->skipped) {
+		snprintf(s, sizeof(s), "%s%zu skipped; showing %zu frames", capture->limited ? "LIMIT: " : "",
+		         capture->skipped, capture->count);
+		text(24, 426, C_HOLD, s);
+	} else text(24, 426, C_DIM, "Driver metadata; ? = suspect value. Timeline shows packet counts.");
+	text(8, 448, C_TEXT, "A play/pause  Left/Right packet  L1/R1 speed  Up/Down seek 1s");
+	text(8, 466, C_DIM, "B back  MENU quit  START screenshot");
+}
+
+static int packet_review(const char *path, const char *shot, double start)
+{
+	struct packet_capture capture;
+	char error[160];
+	unsigned bins[3][PACKET_W] = {{0}}, peak = 0;
+	double pos, last, speed = 1;
+	size_t selected, i;
+	int playing = !shot, back = 0, result = 0;
+	if (pcap_load(path, &capture, error, sizeof(error)) != 0) {
+		fprintf(stderr, "PCAP: %s\n", error); status(error); return 1;
+	}
+	pos = start < capture.duration ? start : capture.duration;
+	selected = packet_at_time(&capture, pos);
+	for (i = 0; i < capture.count; i++) {
+		const struct packet_record *p = &capture.packets[i];
+		int bin = capture.duration > 0 ? (int)(p->time / capture.duration * (PACKET_W - 1)) : 0;
+		unsigned total;
+		int category = p->type < 3 ? p->type : 2;
+		bins[category][bin]++;
+		total = bins[0][bin] + bins[1][bin] + bins[2][bin];
+		if (total > peak) peak = total;
+	}
+	last = now_s();
+	while (!quit && !back) {
+		double t = now_s();
+		if (playing) {
+			pos += (t - last) * speed;
+			if (pos >= capture.duration) { pos = capture.duration; playing = 0; }
+			selected = packet_at_time(&capture, pos);
+		}
+		last = t;
+		packet_render(&capture, path, selected, pos, speed, playing, bins, peak);
+		if (shot) { result = write_image(shot) != 0; break; }
+		present();
+#ifdef __linux__
+		{
+			struct input_event ev[16];
+			ssize_t n;
+			while (in_fd >= 0 && (n = read(in_fd, ev, sizeof(ev))) > 0) {
+				int k;
+				for (k = 0; k < (int)(n / sizeof(ev[0])); k++) {
+					if (ev[k].type != EV_KEY || !ev[k].value) continue;
+					switch (ev[k].code) {
+					case KEY_SPACE:
+						if (!playing && selected + 1 == capture.count && pos >= capture.duration) {
+							pos = 0; selected = 0;
+						}
+						playing = !playing; break;
+					case KEY_LEFT:
+						playing = 0; if (selected) selected--;
+						pos = capture.packets[selected].time; break;
+					case KEY_RIGHT:
+						playing = 0; if (selected + 1 < capture.count) selected++;
+						pos = capture.packets[selected].time; break;
+					case KEY_UP: case KEY_DOWN:
+						pos += ev[k].code == KEY_UP ? 1 : -1;
+						if (pos < 0) pos = 0;
+						if (pos > capture.duration) pos = capture.duration;
+						selected = packet_at_time(&capture, pos); break;
+					case KEY_E: if (speed > 0.25) speed /= 2; break;
+					case KEY_T: if (speed < 8) speed *= 2; break;
+					case KEY_ENTER: save_screenshot(); break;
+					case KEY_LEFTCTRL: back = 1; break;
+					case KEY_ESC: quit = 1; break;
+					}
+				}
+			}
+		}
+#endif
+		usleep(15000);
+	}
+	fprintf(stderr, "replay: %zu frames, %.6f seconds, %zu skipped%s\n", capture.count,
+	        capture.duration, capture.skipped, capture.limited ? " (record limit reached)" : "");
+	pcap_free(&capture);
+	return result;
+}
+
 /* Replay a saved recording (a CSV under rec/) as spectrum + waterfall, reusing
  * the live render(). Handles both the sweep recordings (X) and burst captures. */
 
@@ -1912,43 +2101,50 @@ static void review_play(const char *path)
 
 static void review_session(void)
 {
-	char names[64][256], path[320];
-	int count = 0, sel = 0, i, j;
-	DIR *d;
-	struct dirent *e;
-
-	if (in_fd < 0)
-		return;
-	d = opendir("rec");
-	if (d) {
-		while ((e = readdir(d)) != NULL && count < 64) {
+	char names[128][320], path[320];
+	static const char *directories[] = { "rec", "research" };
+	int count = 0, sel = 0, i, j, folder;
+	if (in_fd < 0) return;
+	sel_down = sel_combo = 0;
+	for (folder = 0; folder < 2; folder++) {
+		DIR *d = opendir(directories[folder]);
+		struct dirent *e;
+		if (!d) continue;
+		while ((e = readdir(d)) != NULL && count < 128) {
 			size_t l = strlen(e->d_name);
-			if (l > 4 && !strcmp(e->d_name + l - 4, ".csv"))
-				snprintf(names[count++], 256, "%s", e->d_name);
+			if ((l > 4 && !strcmp(e->d_name + l - 4, ".csv")) ||
+			    (l > 5 && !strcmp(e->d_name + l - 5, ".pcap"))) {
+				snprintf(names[count++], sizeof(names[0]), "%s/%s", directories[folder], e->d_name);
+			}
 		}
 		closedir(d);
 	}
-	for (i = 0; i < count; i++) /* newest-named first */
+	for (i = 0; i < count; i++)
 		for (j = i + 1; j < count; j++)
-			if (strcmp(names[j], names[i]) > 0) {
-				char tmp[256];
-				memcpy(tmp, names[i], 256);
-				memcpy(names[i], names[j], 256);
-				memcpy(names[j], tmp, 256);
+			if (strcmp(strrchr(names[j], '/') + 1, strrchr(names[i], '/') + 1) > 0) {
+				char tmp[320];
+				memcpy(tmp, names[i], sizeof(tmp));
+				memcpy(names[i], names[j], sizeof(tmp));
+				memcpy(names[j], tmp, sizeof(tmp));
 			}
-
 	while (!quit) {
-		int chosen = -1, cancel = 0;
+		int chosen = -1, cancel = 0, first = sel / 22 * 22;
 		fill(0, 0, SW, SH, C_BG);
-		text(4, 6, C_TEXT, "REVIEW: pick a recording");
-		if (count == 0)
-			text(24, 40, C_DIM, "No recordings yet. Press X while scanning to make one. B to go back.");
-		for (i = 0; i < count && 30 + i * 18 < SH - 40; i++) {
-			int y = 30 + i * 18;
-			if (i == sel)
-				text(8, y, C_LIVE, ">");
-			text(24, y, i == sel ? C_LIVE : C_DIM, names[i]);
+		text(4, 6, C_TEXT, "REVIEW: spectrum recordings and packet captures");
+		if (count == 0) {
+			text(24, 48, C_DIM, "Save spectrum recordings or copy PCAPs to rec/ or research/.");
+			text(24, 72, C_DIM, "The capture tool's stock-monitor.pcap appears here automatically.");
 		}
+		for (i = first; i < count && i < first + 22; i++) {
+			char label[80];
+			int y = 30 + (i - first) * 18;
+			size_t l = strlen(names[i]);
+			int is_packet = l > 5 && !strcmp(names[i] + l - 5, ".pcap");
+			if (i == sel) text(8, y, C_LIVE, ">");
+			snprintf(label, sizeof(label), "[%s] %.68s", is_packet ? "PCAP" : "CSV ", names[i]);
+			text(24, y, i == sel ? C_LIVE : C_DIM, label);
+		}
+		if (status_until > now_s()) text(4, 438, C_HOLD, status_msg);
 		text(4, SH - 20, C_DIM, "Up/Down choose    A open    B back");
 		present();
 #ifdef __linux__
@@ -1958,25 +2154,25 @@ static void review_session(void)
 			while (in_fd >= 0 && (n = read(in_fd, ev, sizeof(ev))) > 0) {
 				int k;
 				for (k = 0; k < (int)(n / sizeof(ev[0])); k++) {
-					if (ev[k].type != EV_KEY || !ev[k].value)
-						continue;
+					if (ev[k].type != EV_KEY || !ev[k].value) continue;
 					switch (ev[k].code) {
 					case KEY_UP: if (sel > 0) sel--; break;
 					case KEY_DOWN: if (sel < count - 1) sel++; break;
-					case KEY_SPACE: if (count) chosen = sel; break; /* A */
-					case KEY_LEFTCTRL: cancel = 1; break;           /* B */
-					case KEY_ESC: quit = 1; break;                  /* MENU */
+					case KEY_SPACE: if (count) chosen = sel; break;
+					case KEY_LEFTCTRL: cancel = 1; break;
+					case KEY_ESC: quit = 1; break;
 					}
 				}
 			}
 		}
 #endif
 		if (chosen >= 0) {
-			snprintf(path, sizeof(path), "rec/%s", names[chosen]);
-			review_play(path);
-		} else if (cancel) {
-			return;
-		}
+			size_t l;
+			snprintf(path, sizeof(path), "%s", names[chosen]);
+			l = strlen(path);
+			if (l > 5 && !strcmp(path + l - 5, ".pcap")) packet_review(path, NULL, 0);
+			else review_play(path);
+		} else if (cancel) return;
 		usleep(15000);
 	}
 }
@@ -1994,7 +2190,9 @@ static void print_row(const char *tag, const float *v)
 
 int main(int argc, char **argv)
 {
-	const char *shot = NULL;
+	const char *shot = NULL, *replay_path = NULL;
+	int review_only = 0, replay_at_set = 0, pm_only = 0;
+	double replay_at = 0;
 	int dump = 0, probe = 0, racap = 0, burst_sec = 0, i, shot_after = 12, zlevel = 0, use_settings = argc == 1;
 	double t0, last_rate_t, last_flush, last_diag = 0, zf = 0, burst_mhz = 0;
 	long last_sweeps = 0;
@@ -2007,6 +2205,20 @@ int main(int argc, char **argv)
 			dump = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--shot") && i + 1 < argc)
 			shot = argv[++i];
+		else if (!strcmp(argv[i], "--replay")) {
+			if (++i >= argc) { fprintf(stderr, "--replay requires a PCAP path\n"); return 2; }
+			replay_path = argv[i];
+		} else if (!strcmp(argv[i], "--review")) {
+			review_only = 1;
+		} else if (!strcmp(argv[i], "--replay-at")) {
+			char *end;
+			if (++i >= argc) { fprintf(stderr, "--replay-at requires seconds\n"); return 2; }
+			replay_at = strtod(argv[i], &end);
+			if (end == argv[i] || *end || !isfinite(replay_at) || replay_at < 0) {
+				fprintf(stderr, "--replay-at requires nonnegative finite seconds\n"); return 2;
+			}
+			replay_at_set = 1;
+		}
 		else if (!strcmp(argv[i], "--probe"))
 			probe = 1;
 		else if (!strcmp(argv[i], "--raw-tune"))
@@ -2030,8 +2242,7 @@ int main(int argc, char **argv)
 		} else if (!strcmp(argv[i], "--settings")) { /* tests: use settings.txt with options too */
 			use_settings = 1;
 		} else if (!strcmp(argv[i], "--pm-active")) {
-			pm_active();
-			return 0;
+			pm_only = 1;
 		}
 	}
 
@@ -2040,6 +2251,27 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
+	if (replay_at_set && !replay_path) {
+		fprintf(stderr, "--replay-at requires --replay FILE.pcap\n"); return 2;
+	}
+	if (replay_path || review_only) {
+		int result;
+		if (review_only && shot && !replay_path) {
+			fprintf(stderr, "--shot requires --replay FILE.pcap in offline review\n"); return 2;
+		}
+		if (!shot && fb_open() != 0) { fprintf(stderr, "no framebuffer\n"); fb_close(); return 3; }
+		if (!shot && in_fd < 0) {
+			fprintf(stderr, "no input device for replay controls\n"); fb_close(); return 3;
+		}
+		make_lut();
+		view_full();
+		sweeps = 1; /* CSV review renders loaded traces without a live sweep. */
+		if (replay_path) result = packet_review(replay_path, shot, replay_at);
+		else { review_session(); result = 0; }
+		fb_close();
+		return result;
+	}
+	if (pm_only) { pm_active(); return 0; }
 
 	if (!fake && radio_open() != 0)
 		return 2;

@@ -12,6 +12,14 @@ WPA=/mnt/SDCARD/miyoo/app/wpa_supplicant
 unset LD_PRELOAD
 export LD_LIBRARY_PATH="/config/lib:/customer/lib:$LD_LIBRARY_PATH"
 
+# Offline playback does not need radio setup or exclusive access to audio.
+for arg in "$@"; do
+	if [ "$arg" = --replay ] || [ "$arg" = --review ]; then
+		chmod +x "$APPDIR/miyoosdr"
+		exec "$APPDIR/miyoosdr" "$@"
+	fi
+done
+
 log() { echo "$(date +%T) $*" >> "$LOG"; }
 
 had_wpa=0; pgrep wpa_supplicant >/dev/null 2>&1 && had_wpa=1

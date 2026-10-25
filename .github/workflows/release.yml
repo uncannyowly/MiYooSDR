@@ -38,6 +38,7 @@ jobs:
           echo "$RUNNER_TEMP/miyoomini-toolchain/usr/bin" >> "$GITHUB_PATH"
       - name: Build and package
         run: |
+          make test
           make miyoo
           python3 tools/package.py "$RELEASE_VERSION"
           cd dist

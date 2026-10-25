@@ -1,4 +1,5 @@
 build/
+__pycache__/
 *.ppm
 app/MiYooSDR/miyoosdr
 app/MiYooSDR/rec/

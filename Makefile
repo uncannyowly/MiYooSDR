@@ -14,14 +14,19 @@ build/miyoo/miyoo-pcap: tools/miyoo-pcap.c
 	mkdir -p $(dir $@)
 	arm-linux-gnueabihf-gcc $(CFLAGS) -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -o $@ $<
 
-build/host/miyoosdr: src/main.c src/font.h
+build/host/miyoosdr: src/main.c src/font.h src/pcap.c src/pcap.h
 	mkdir -p $(dir $@)
-	cc $(CFLAGS) -o $@ src/main.c -lm
+	cc $(CFLAGS) -o $@ src/main.c src/pcap.c -lm
 
-build/miyoo/miyoosdr: src/main.c src/font.h
+build/miyoo/miyoosdr: src/main.c src/font.h src/pcap.c src/pcap.h
 	mkdir -p $(dir $@)
-	arm-linux-gnueabihf-gcc $(CFLAGS) -DMIYOO -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -o $@ src/main.c -lm -lpthread -ldl
+	arm-linux-gnueabihf-gcc $(CFLAGS) -DMIYOO -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -o $@ src/main.c src/pcap.c -lm -lpthread -ldl
 
 clean:
 	rm -rf build
-.PHONY: host miyoo clean
+
+test: build/host/miyoosdr
+	python3 tests/test_pcap.py
+	python3 tests/test_replay.py
+
+.PHONY: host miyoo clean test

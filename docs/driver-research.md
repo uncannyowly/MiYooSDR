@@ -4,7 +4,8 @@
 
 The stock module already supports useful Wi-Fi monitor capture through Wireless
 Extensions. A replacement driver is not required for the first packet-analysis
-milestone. The spectrum application itself remains a sequential PSD viewer.
+milestone. Spectrum capture remains a sequential PSD measurement; the application
+also supports offline analysis of the saved PCAP files.
 
 Device identification:
 
@@ -96,8 +97,9 @@ accidentally rerunning before recovery is checked. Once networking is restored
 and the experiment has finished, remove that empty directory with `rmdir` before
 another run. Do not remove it during an active experiment.
 
-Retrieve `research/stock-monitor.pcap` and open it in Wireshark. For a summary
-that omits addresses and payloads:
+Open `research/stock-monitor.pcap` on the Miyoo through the **SELECT + START**
+recording browser, or retrieve it and open it in Wireshark. For a summary that
+omits addresses and payloads:
 
 ```sh
 uv run --with scapy tools/inspect-capture.py build/research/stock-monitor.pcap
@@ -114,6 +116,43 @@ The capture utility can also be invoked directly on the device:
 Use the detached wrapper over Wi-Fi SSH so recovery is scheduled before changing
 the mode. There is no channel hopping or transmit/injection operation in this
 utility. Returning to managed operation resumes normal Wi-Fi transmissions.
+
+## Playback on the Miyoo
+
+MiYooSDR 0.5.0 adds offline PCAP playback alongside existing spectrum CSV review.
+The **SELECT + START** browser lists `.pcap` and `.csv` files from `rec/` and
+`research/`, relative to the application directory. The capture script's default
+`research/stock-monitor.pcap` therefore appears without moving the file.
+
+The PCAP view follows capture timestamps, shows packet counts over time and a
+rolling frame list, and displays selected-frame addresses, type, length, and
+available radiotap rate, signal and channel values. A pauses or resumes; Left /
+Right pause and step a packet; L1 / R1 change speed from 0.25× through 8×; Up /
+Down seek by a second. B returns to the browser, MENU quits, and START saves a
+screenshot. Playback stops at the end; A restarts it.
+
+To start directly in offline review, preserving the active Wi-Fi connection and
+skipping the launcher's audio teardown:
+
+```sh
+cd /mnt/SDCARD/App/MiYooSDR
+./launch.sh --replay research/stock-monitor.pcap
+```
+
+The viewer accepts classic PCAP with radiotap link type 127, in either byte order,
+with microsecond or nanosecond timestamps and a limit of 100,000 records. It does
+not accept PCAPNG. It displays captured frame information without decrypting
+protected payloads, reconstructing spectrum or I/Q samples, or transmitting
+frames. The driver's metadata limitations below still apply during playback.
+The separate capture utility and detached recovery script are unchanged.
+
+For a repeatable host rendering at 2.5 seconds after the first packet:
+
+```sh
+make host
+build/host/miyoosdr --replay build/research/stock-monitor.pcap \
+  --replay-at 2.5 --shot packet-review.png
+```
 
 ## Metadata issues to fix before trusting PHY analysis
 
