@@ -34,7 +34,7 @@ def package(version):
         "CREDITS.md": "CREDITS.md",
         "docs/driver-research.md": "docs/driver-research.md",
         "docs/screenshot.png": "docs/screenshot.png",
-        "docs/releases/0.4.0.md": "docs/releases/0.4.0.md",
+        f"docs/releases/{version}.md": f"docs/releases/{version}.md",
     }
     for name in ("miyoosdr", "research/miyoo-pcap"):
         header = (ROOT / files[name]).read_bytes()[:20]

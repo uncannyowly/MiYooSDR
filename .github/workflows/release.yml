@@ -1,0 +1,69 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Validate release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          version="${RELEASE_TAG#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          test -f "docs/releases/$version.md"
+          echo "RELEASE_VERSION=$version" >> "$GITHUB_ENV"
+      - name: Install Miyoo cross-compiler
+        env:
+          TOOLCHAIN_URL: https://github.com/shauninman/miyoomini-toolchain-buildroot/releases/download/v0.0.3/miyoomini-toolchain.tar.xz
+        run: |
+          curl --fail --location --retry 3 "$TOOLCHAIN_URL" -o "$RUNNER_TEMP/miyoomini-toolchain.tar.xz"
+          echo "e158b6ebde0c933ecd57b36760fb8602fad4176a09fb61559dc7bcffe6624f2e  $RUNNER_TEMP/miyoomini-toolchain.tar.xz" | sha256sum --check
+          tar -xJf "$RUNNER_TEMP/miyoomini-toolchain.tar.xz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/miyoomini-toolchain/usr/bin" >> "$GITHUB_PATH"
+      - name: Build and package
+        run: |
+          make miyoo
+          python3 tools/package.py "$RELEASE_VERSION"
+          cd dist
+          sha256sum --check "miyoosdr-$RELEASE_VERSION.zip.sha256"
+      - name: Publish build and release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          version = os.environ['RELEASE_VERSION']
+          notes = Path(f'docs/releases/{version}.md').read_text()
+          target = f"https://github.com/{os.environ['GH_REPO']}/blob/{os.environ['RELEASE_TAG']}/docs/driver-research.md"
+          notes = notes.replace('](../driver-research.md)', f']({target})')
+          checksum = Path(f'dist/miyoosdr-{version}.zip.sha256').read_text().split()[0]
+          notes += f'\nSHA-256: `{checksum}`\n'
+          Path('build/release-notes.md').write_text(notes)
+          PY
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --prerelease \
+              --title "MiYooSDR $RELEASE_VERSION (experimental)" --notes-file build/release-notes.md
+          fi
+          gh release upload "$RELEASE_TAG" \
+            "dist/miyoosdr-$RELEASE_VERSION.zip" "dist/miyoosdr-$RELEASE_VERSION.zip.sha256" --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --prerelease \
+            --title "MiYooSDR $RELEASE_VERSION (experimental)" --notes-file build/release-notes.md

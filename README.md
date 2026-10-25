@@ -132,6 +132,10 @@ ports use (Shaun Inman's `miyoomini-toolchain`, via Docker):
 ./build.sh          # -> both ARM binaries and dist/miyoosdr-0.4.0.zip
 ```
 
+Pushing a version tag such as `v0.4.0` runs the GitHub release workflow. It builds
+both binaries and publishes the installation ZIP, SHA-256 checksum, and matching
+notes from `docs/releases/<version>.md` as an experimental prerelease.
+
 For a desktop build with a synthetic radio, to work on the UI without hardware:
 
 ```sh
