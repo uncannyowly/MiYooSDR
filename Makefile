@@ -3,8 +3,16 @@
 # The device build defines MIYOO, which enables the SigmaStar MI_AO audio path.
 CFLAGS := -std=gnu99 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation
 
-host: build/host/miyoosdr
-miyoo: build/miyoo/miyoosdr
+host: build/host/miyoosdr build/host/miyoo-pcap
+miyoo: build/miyoo/miyoosdr build/miyoo/miyoo-pcap
+
+build/host/miyoo-pcap: tools/miyoo-pcap.c
+	mkdir -p $(dir $@)
+	cc $(CFLAGS) -o $@ $<
+
+build/miyoo/miyoo-pcap: tools/miyoo-pcap.c
+	mkdir -p $(dir $@)
+	arm-linux-gnueabihf-gcc $(CFLAGS) -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -o $@ $<
 
 build/host/miyoosdr: src/main.c src/font.h
 	mkdir -p $(dir $@)

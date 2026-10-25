@@ -94,12 +94,20 @@ App/MiYooSDR/miyoosdr --burst <MHz> <seconds>   # park on one channel, log power
 ```
 
 It stays on a single channel and records all 128 bins at about 25 sweeps per
-second, which is enough to see the timing of short transmissions.
+second. Each bin is revisited roughly every 40 ms; short transmissions can be
+missed, and these measurements do not resolve individual packet durations.
 
-**There is no true raw IQ.** This chip exposes a power meter, not raw samples.
-The Realtek logic-analyzer / ADC-capture block that some of its siblings have is
-not wired up on the RTL8188FU (its enable register does not respond), so MiYooSDR
-records power against frequency and time, not a demodulatable sample stream.
+**There is no demonstrated raw I/Q capture path.** MiYooSDR records power against
+frequency and time, not a demodulatable sample stream. Its experimental `--racap`
+probe did not establish a working ADC/logic-analyzer capture sequence; that does
+not prove every possible debug capture path is absent.
+
+**Wi-Fi packet capture does work with the tested stock driver.** A separate
+research utility activates monitor mode through Wireless Extensions and saves
+802.11 frames with radiotap headers to PCAP, even though `iw list` does not
+advertise monitor support. This does not decode Bluetooth or Zigbee. See
+[`docs/driver-research.md`](docs/driver-research.md) for the on-device results,
+build instructions, automatic Wi-Fi recovery, and metadata limitations.
 
 ## How it works
 
@@ -121,7 +129,7 @@ The Miyoo binary is cross-compiled in the same toolchain image the other Miyoo
 ports use (Shaun Inman's `miyoomini-toolchain`, via Docker):
 
 ```sh
-./build.sh          # -> build/miyoo/miyoosdr, and the App/MiYooSDR app folder
+./build.sh          # -> both ARM binaries and dist/miyoosdr-0.4.0.zip
 ```
 
 For a desktop build with a synthetic radio, to work on the UI without hardware:
