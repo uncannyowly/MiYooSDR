@@ -1,50 +1,81 @@
 # MiYooSDR
 
-A live **2.4 GHz spectrum analyzer and waterfall** for the **Miyoo Mini Plus**,
-with **saved Wi-Fi packet playback** on the handheld. Built from the handheld's
-own Wi-Fi chip. No SDR dongle, no extra hardware.
+Experimental **2.4 GHz energy visualization, Wi-Fi packet capture, and saved
+capture review** for the **Miyoo Mini Plus**, using its built-in RTL8188FU radio.
+No external receiver is needed for the supported live measurements and captures.
 
-The Mini Plus has a Realtek **RTL8188FU** Wi-Fi chip. Buried in its baseband is a
-power-spectral-density (PSD) engine meant for factory testing: it measures how
-much RF energy sits at a chosen frequency. MiYooSDR drives that engine through the
-vendor driver's `/proc` interface, sweeps it across the band, and draws a live
-spectrum and a scrolling waterfall on the screen. You can watch Wi-Fi, Bluetooth
-and other 2.4 GHz traffic around you, zoom in, and record what you see.
+## Current state
 
-> **Experimental.** This began as a spike to find out whether the idea worked, and
-> the code still reads like one. It is a spectrum viewer, not a polished app.
-> Spectrum capture measures energy and cannot demodulate a signal. Packet review
-> displays headers and metadata from saved Wi-Fi captures; it does not transmit
-> them. Live spectrum mode restores Wi-Fi when it exits.
+The current published version is **[0.5.0 (experimental)](https://github.com/uncannyowly/MiYooSDR/releases/tag/v0.5.0)**.
+There are three separate workflows:
 
-Besides the live spectrum and waterfall it also has a **channel occupancy** view
-(per Wi-Fi-channel activity bars, to find a clear channel), **signal-to-sound**
-(a tone that rises as you move the cursor onto a signal, handy for direction
-finding), and a **review** mode for saved spectrum CSVs and Wi-Fi PCAPs. Packet
-playback shows a traffic timeline, frame list, and selected-frame details.
-It names what uses the frequency under the cursor (Bluetooth LE, Wi-Fi, Zigbee),
-counts the **bursts** there (how often a remote or sensor transmits, and for how
-long), and remembers your view between launches.
+| Workflow | Available now | How to use it |
+| --- | --- | --- |
+| Live spectrum view | Sequential PSD power measurements, waterfall, zoom, relative channel-activity bars, audio tone, CSV recording and review | Launch MiYooSDR from Onion's Apps list |
+| Wi-Fi packet capture | 802.11 frames with driver-provided radiotap metadata, saved as PCAP using the stock driver | Run the separate `research/monitor-capture.sh` script over SSH |
+| Saved packet playback | Packet-count timeline, frame list, header fields and available PHY metadata | Open a PCAP through SELECT + START, or use `--replay` |
+
+Spectrum recording with **X** saves power measurements as CSV. It does not start
+packet capture. The recording browser opens saved files; there is currently no
+in-app button to start the command-line packet capture tool.
+
+**Raw I/Q capture has not been demonstrated.** The PSD viewer measures power one
+frequency bin at a time; a waterfall row is assembled from measurements taken at
+different times. It does not classify or decode Wi-Fi, Bluetooth, or Zigbee from
+those measurements. The channel names shown at the cursor are frequency
+references. Packet playback reads already captured 802.11 headers and metadata.
+No CSI extraction, payload decryption, frame injection, or over-the-air replay is
+implemented. Normal Wi-Fi operation before and after capture still transmits.
+
+### What has been verified
+
+On one Miyoo Mini Plus running OnionOS, Linux **4.9.84**, and stock driver
+**`v5.7.4.2_36687.20200421`**:
+
+- An eight-second monitor capture saved **3,647 frames**, including 202 beacons,
+  on channel 11. Independent host analysis verified all saved frame checksums;
+  the packet socket reported zero drops. This does not prove every over-the-air
+  frame was received. Managed Wi-Fi recovered after that experiment.
+- Offline playback loaded that capture and rendered a screenshot on the Miyoo
+  that matched the host rendering byte for byte, while Wi-Fi stayed connected.
+- Automated tests cover PCAP parsing, malformed files, record limits, offline
+  rendering, and launcher behavior. Hardware validation does not yet cover every
+  interactive control or other driver/OS versions.
+
+The stock driver can report incorrect rates and suspect signal values. No
+replacement kernel or driver has been built or loaded for these features. See
+the [research notes](docs/driver-research.md) for the evidence and limitations.
 
 ![MiYooSDR showing a 2.4 GHz spectrum and waterfall](docs/screenshot.png)
 
 ## Requirements
 
-- A **Miyoo Mini Plus** (the plain Mini, v1 to v4, has no Wi-Fi chip and will not work).
-- **OnionOS** with its stock `8188fu` Wi-Fi driver (the one MiYooSDR talks to).
+- Live spectrum and packet capture require a **Miyoo Mini Plus** with its
+  RTL8188FU radio and **OnionOS**. The plain Mini has no built-in Wi-Fi radio.
+- The tested stock driver version is listed above; compatibility with other
+  drivers is unverified. Spectrum mode needs the vendor driver's register proc
+  entries; packet capture uses Wireless Extensions monitor mode.
+- Offline playback does not access Wi-Fi, but has only been tested on the Mini
+  Plus. Interactive display uses the Linux framebuffer and input device.
 
 ## Install
 
-1. Download `miyoosdr-<version>.zip` from [Releases](../../releases).
+1. Download `miyoosdr-<version>.zip` from [Releases](https://github.com/uncannyowly/MiYooSDR/releases).
 2. Extract it to the root of your SD card. It drops in as `App/MiYooSDR`.
 3. On the Mini Plus, open it from Onion's **Apps** list.
 
 Live spectrum mode takes Wi-Fi offline so nothing retunes the radio mid-sweep.
-When you quit, the launcher brings Wi-Fi back the way Onion starts it (this takes
-a few seconds). Opening a capture directly with `launch.sh --replay` skips radio
-setup and the launcher's Wi-Fi and audio teardown.
+On exit, the launcher attempts to restore Onion's networking. Opening a capture
+directly with `launch.sh --replay`, or the browser with `launch.sh --review`, skips
+radio setup and the launcher's Wi-Fi and audio teardown. Opening review from a
+running live-spectrum session keeps that session's Wi-Fi-off state until exit.
 
-## Controls
+The ZIP includes both binaries, scripts, and documentation. It contains no sample
+recordings or captured network traffic. Create a capture or copy in a compatible
+file before using packet playback. Existing recordings and settings are preserved
+when extracting the ZIP over an installed copy.
+
+## Live spectrum controls
 
 | Button | Action |
 | --- | --- |
@@ -53,7 +84,7 @@ setup and the launcher's Wi-Fi and audio teardown.
 | SELECT (tap) | Jump the cursor to the strongest peak |
 | SELECT + Y | Cycle the spectrum view: line, filled, filled with Wi-Fi band shading |
 | SELECT + A | Cycle the colour palette (Ember, Spectrum, Ice, Matrix) |
-| SELECT + B | Switch the lower panel between waterfall and channel occupancy |
+| SELECT + B | Switch between waterfall and relative channel-activity bars |
 | SELECT + X | Signal-to-sound: a tone whose pitch follows the level under the cursor |
 | SELECT + START | Browse saved spectrum CSVs and Wi-Fi PCAPs |
 | Y | Enhance: show dB above the slow background instead of absolute level |
@@ -65,23 +96,30 @@ setup and the launcher's Wi-Fi and audio teardown.
 | START | Save a screenshot (`App/MiYooSDR/shots/sdr-<date>-<time>.png`) |
 | MENU | Quit |
 
-Levels are **uncalibrated** relative dB. The full-band view covers roughly
-2402 to 2482 MHz in 256 bins; zoomed views use larger on-chip FFTs on a single
-channel, down to about 39 kHz per bin.
+Levels are **uncalibrated** relative dB, not measured dBm. The nominal full-band
+view covers roughly 2402 to 2482 MHz in 256 bins. Zoomed views use larger on-chip
+FFTs on a single channel, down to about 39 kHz nominal bin spacing. This is not a
+calibrated frequency-resolution or receiver-sensitivity specification.
 
 ## Reading the screen
 
-- **Right of the spectrum:** the cursor frequency, its level now, its max hold and
-  the background, then what uses that frequency: the Bluetooth LE channel (`ADV 37`,
-  `ADV 38` and `ADV 39` in yellow are the advertising channels that beacons, phones
-  and most BLE remotes use), the Wi-Fi channel and the Zigbee / 802.15.4 channel.
-  Yellow ticks on the spectrum's bottom edge mark the three advertising channels.
-- **Right of the waterfall:** **BURSTS** counts transmissions at the cursor: the
-  level rising 8 dB over the background and falling back. Below it are the time
-  since the last burst, the typical spacing between bursts and the last one's
-  length. Park the cursor on a signal (SELECT jumps to the strongest) and zoom in
-  for finer timing: a full-band sweep takes about 0.2 s, a zoomed one 0.05 to
-  0.15 s. B clears the count, and moving the cursor starts a new one.
+- **Frequency references:** the cursor panel shows frequency, current level,
+  max hold and background, plus the BLE, Wi-Fi and Zigbee channel numbers that
+  correspond to that frequency. Yellow ticks mark BLE advertising channels 37,
+  38 and 39. These labels do not identify the source or protocol of a signal.
+- **BURSTS:** counts sampled energy excursions near the cursor (its bin and two
+  neighbours). An event starts above 8 dB over the adaptive background and ends
+  below 5 dB. Its count, spacing and duration are limited by sweep timing; short
+  events can be missed or merged. They are not individual packet counts or exact
+  transmission durations. Typical observed sweep times are about 0.2 s full-band
+  and 0.05–0.15 s zoomed, depending on mode. B clears the count; moving the cursor
+  resets it.
+- **Channel occupancy view:** the bars show relative energy above the adaptive
+  background across overlapping Wi-Fi channel windows. They update in full-band
+  mode and remain unchanged while zoomed. They are not measured airtime or a
+  guarantee that a suggested channel is clear.
+- **Signal-to-sound:** the tone follows the relative level at the cursor. It is
+  an audio aid, not a validated direction-finding or distance measurement.
 - **Remembered:** palette, view style, lower panel, enhance, max hold, zoom and the
   cursor are saved to `App/MiYooSDR/settings.txt` when you quit and restored on the
   next start. Delete the file to start fresh.
@@ -94,9 +132,11 @@ Press **SELECT + START** to open the recording browser. It lists `.csv` and
 compatible captures into either directory. Use Up / Down to select a file, A to
 open it, and B to return.
 
-PCAP playback shows packet counts over time, a scrolling frame list, and details
-for the selected frame: type, addresses, length, and available rate, signal and
-channel metadata. It follows the capture timestamps and stops at the end.
+PCAP playback shows management/control/data frame counts over time, a scrolling
+frame list, and the selected frame's type, transmitter/receiver addresses,
+sequence, length, flags, and available rate, signal and frequency metadata.
+Playback timing uses the stored timestamps and stops at the end. The capture
+tool records Linux delivery timestamps, not hardware RF arrival timestamps.
 
 | Button during PCAP playback | Action |
 | --- | --- |
@@ -108,15 +148,20 @@ channel metadata. It follows the capture timestamps and stops at the end.
 | B | Return to the recording browser |
 | MENU | Quit |
 
-Spectrum CSV review remains available in the same browser. A PCAP contains packet
-data, not the spectrum power bins used by CSV review; playback cannot reconstruct
-a waveform or waterfall from it. Protected payloads are not decrypted, and driver
-metadata can be inaccurate; see the [known limitations](docs/driver-research.md#metadata-issues-to-fix-before-trusting-phy-analysis).
+Spectrum CSV review remains available in the same browser. The packet viewer
+keeps header metadata and discards payloads while loading; it does not provide
+payload inspection or decryption. PCAP playback cannot reconstruct spectrum power
+bins, a waveform, or a waterfall. It displays driver-supplied bad-FCS flags but
+does not independently check frame checksums. The separate host inspection tool
+can check FCS. See the [known metadata limitations](docs/driver-research.md#metadata-issues-to-fix-before-trusting-phy-analysis).
 
 Supported PCAP files use classic PCAP with radiotap link type 127, microsecond or
-nanosecond timestamps, and either byte order, with a limit of 100,000 records.
-PCAPNG is not supported. In Wireshark, choose the `pcap` file format when exporting
-a compatible capture.
+nanosecond timestamps, and either byte order. Loading stops after the first
+100,000 on-disk records, including skipped records, and indicates if the file was
+limited. Unsupported or malformed individual frame headers are skipped; invalid
+or truncated PCAP containers fail with an error. Backward timestamps are clamped
+to keep playback time nondecreasing. PCAPNG and other link types are unsupported.
+In Wireshark, choose the `pcap` format when exporting a radiotap capture.
 
 To open a PCAP directly on the Miyoo without starting live radio capture:
 
@@ -125,66 +170,112 @@ cd /mnt/SDCARD/App/MiYooSDR
 ./launch.sh --replay research/stock-monitor.pcap
 ```
 
-For a desktop preview or a screenshot at a chosen capture time:
+For a host screenshot at a chosen capture time:
 
 ```sh
 make host
-build/host/miyoosdr --replay capture.pcap
 build/host/miyoosdr --replay capture.pcap --replay-at 2.5 --shot packet-review.png
 ```
 
-`--replay-at` selects seconds from the first packet. Direct PCAP playback reads
-the file without accessing the Wi-Fi radio.
+`--replay-at` selects seconds from the first supported packet. Direct PCAP playback
+reads the file without accessing the Wi-Fi radio.
 
 Use `./launch.sh --review` to open the recording browser directly without starting
-live radio capture. Run `make test` for parser and offline-playback regressions.
+live radio capture. Interactive host playback requires `/dev/fb0` and
+`/dev/input/event0`; a normal desktop window is not implemented.
 
-## Recording and raw samples
+## Recording spectrum measurements
 
-Pressing **X** records every sweep to `App/MiYooSDR/rec/*.csv` (seconds, gain,
-then dB per bin). Zoom to one channel first and it records just that slice.
+Pressing **X** records every sweep to `App/MiYooSDR/rec/*.csv`: elapsed seconds,
+gain, view level, then relative bin levels as integers in tenths of a dB. Comment
+lines describe the view's frequency mapping. Zoom first to record that slice.
 
-For a controlled high-rate capture there is a headless mode:
+The headless `--burst` mode records a single-channel PSD sweep:
 
 ```sh
-App/MiYooSDR/miyoosdr --burst <MHz> <seconds>   # park on one channel, log power vs time
+cd /mnt/SDCARD/App/MiYooSDR
+./launch.sh --burst 2462 10
 ```
 
-It stays on a single channel and records all 128 bins at about 25 sweeps per
-second. Each bin is revisited roughly every 40 ms; short transmissions can be
-missed, and these measurements do not resolve individual packet durations.
+It stays on a single channel and records all 128 bins. Observed capture rates
+were about 25 sweeps per second, revisiting each bin roughly every 40 ms. Short
+transmissions can be missed, and these measurements do not resolve individual
+packet durations.
 
-**There is no demonstrated raw I/Q capture path.** MiYooSDR records power against
-frequency and time, not a demodulatable sample stream. Its experimental `--racap`
-probe did not establish a working ADC/logic-analyzer capture sequence; that does
-not prove every possible debug capture path is absent.
+This produces CSV power measurements, not packets or raw I/Q samples.
+
+## Capturing Wi-Fi packets
 
 **Wi-Fi packet capture does work with the tested stock driver.** A separate
 research utility activates monitor mode through Wireless Extensions and saves
 802.11 frames with radiotap headers to PCAP, even though `iw list` does not
-advertise monitor support. Capture remains a command-line operation; the
-recording browser plays the saved file. This does not decode Bluetooth or Zigbee. See
-[`docs/driver-research.md`](docs/driver-research.md) for the on-device results,
-build instructions, automatic Wi-Fi recovery, and metadata limitations.
+advertise monitor support. The supplied wrapper requires the tested Onion
+network setup: an already connected `wlan0`, `wpa_supplicant` and `udhcpc`. It
+captures on the current channel for eight seconds and temporarily disconnects
+Wi-Fi, including SSH. Do not run it alongside the spectrum application.
+
+From an SSH session on the Miyoo:
+
+```sh
+nohup sh /mnt/SDCARD/App/MiYooSDR/research/monitor-capture.sh \
+  > /mnt/SDCARD/App/MiYooSDR/research/monitor-capture.log 2>&1 < /dev/null &
+```
+
+The script attempts to restore managed Wi-Fi afterward and has a 25-second
+recovery timer. Recovery is not guaranteed after driver or kernel failures.
+Once reconnected, inspect the log and retrieve
+`App/MiYooSDR/research/stock-monitor.pcap`, or open it in the recording browser.
+The script overwrites that filename on another run. After confirming recovery
+and that the experiment has finished, remove its empty guard directory before
+rerunning:
+
+```sh
+rmdir /tmp/miyoosdr-monitor-restoring
+```
+
+See the [research instructions](docs/driver-research.md#reproduce) for the tested
+configuration and recovery procedure. Capture does not decode Bluetooth or Zigbee
+and does not ensure all nearby Wi-Fi traffic is received.
+
+## Raw samples and driver research
+
+There is currently no working raw I/Q or CSI export path. The experimental
+`--racap` probe did not establish a usable ADC/logic-analyzer capture sequence;
+that does not prove every undocumented capture path is absent. Register probes
+and direct tuning remain research tools; direct raw tuning has previously hung
+the chip's USB link. These are not required for packet playback or the tested
+packet-capture workflow. Details are in [docs/driver-research.md](docs/driver-research.md).
 
 ## How it works
 
 The chip's PSD engine lives at baseband registers `0x808` (control) and `0x8B4`
 (result). For each point MiYooSDR writes a tone index to `0x808`, pulses the start
 bit, waits for the result to settle, and reads the power from `0x8B4`. The FFT size
-in `0x808[15:14]` sets the resolution (128 to 1024 points over 40 MHz). Channels
+in `0x808[15:14]` selects 128 to 1024 points over a nominal 40 MHz span. Channels
 are changed through the driver's `monitor` proc entry. Registers are reached
 through the driver's `read_reg` / `write_reg` proc files, so **no kernel changes
-are needed**. The driver's power saving is switched off first (otherwise the
-receiver sleeps between beacons and every reading reads the same value).
+are needed**. The driver's power saving is switched off first to avoid stale
+readings while the receiver sleeps.
 
 Full details and the quirks found along the way are in the comments in
 [`src/main.c`](src/main.c).
 
 ## Build
 
-The Miyoo binary is cross-compiled in the same toolchain image the other Miyoo
-ports use (Shaun Inman's `miyoomini-toolchain`, via Docker):
+The ARM binaries use Shaun Inman's Buildroot SDK, with GCC 8.3 and the Miyoo
+libraries/headers. The [release workflow](.github/workflows/release.yml) downloads
+SDK **v0.0.3**, verifies its checksum, runs tests, and cross-compiles both binaries.
+
+With the SDK's `usr/bin` directory on your `PATH`:
+
+```sh
+make miyoo
+python3 tools/package.py 0.5.0
+```
+
+The convenience wrapper below requires Docker and an **existing local image
+named `gta1-miyoo-toolchain`** containing that SDK. The repository does not create
+that image automatically:
 
 ```sh
 ./build.sh          # -> both ARM binaries and dist/miyoosdr-0.5.0.zip
@@ -194,23 +285,25 @@ Pushing a version tag such as `v0.5.0` runs the GitHub release workflow. It buil
 both binaries and publishes the installation ZIP, SHA-256 checksum, and matching
 notes from `docs/releases/<version>.md` as an experimental prerelease.
 
-For a desktop build with a synthetic radio, to work on the UI without hardware:
+For host tests and headless previews, install a native C compiler, Make, Python 3,
+and Linux development headers:
 
 ```sh
 make host
-build/host/miyoosdr --fake            # fake spectrum, runs on /dev/fb0 if present
-build/host/miyoosdr --fake --shot out.png   # render one frame (.png or .ppm) and exit
+make test
+build/host/miyoosdr --fake --shot out.png
 ```
 
 Other modes: `--dump N` (N sweeps as text), `--probe` (PSD timing), `--zoom MHZ LEVEL`,
 `--shot-after N` (sweeps before `--shot` renders, default 12), `--settings` (read and
-write `settings.txt` even when started with options). The fake radio sweeps at about
-the Mini's rate, so burst timing looks like the real thing.
+write `settings.txt` even when started with options). Synthetic input is for UI
+development; it does not validate radio sensitivity, timing accuracy or decoding.
 
 ## Credits and license
 
 Inspired by ESPARGOS [esp-sdr](https://github.com/ESPARGOS/esp-sdr), which turns an
-ESP32's radio into a receive-only SDR. MiYooSDR shares none of its code; it applies
-the same idea to a different chip. See [CREDITS.md](CREDITS.md).
+ESP32's radio into a receive-only SDR through an undocumented raw-I/Q capture
+path. MiYooSDR shares none of its code. Its currently demonstrated live paths are
+Realtek PSD measurements and standard 802.11 frame capture. See [CREDITS.md](CREDITS.md).
 
 Licensed under **GPL-3.0-or-later**. See [LICENSE](LICENSE).
