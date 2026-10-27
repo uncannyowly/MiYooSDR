@@ -4,14 +4,18 @@
 set -eu
 DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TOOL="$DIR/miyoo-pcap"
-WPA=/mnt/SDCARD/miyoo/app/wpa_supplicant
-LOCK=/tmp/miyoosdr-monitor-restoring
+WPA=${MIYOO_WPA:-/mnt/SDCARD/miyoo/app/wpa_supplicant}
+NET=${MIYOO_NET:-/sys/class/net/wlan0}
+LOCK=${MIYOO_LOCK:-/tmp/miyoosdr-monitor-restoring}
 restore() {
     # An occupied guard may mean the watchdog is currently restoring Wi-Fi.
     # Do not report success or let normal cleanup kill that recovery process.
     mkdir "$LOCK" 2>/dev/null || return 1
     echo "Restoring managed Wi-Fi"
-    if ! "$TOOL" wlan0 mode managed || ! ifconfig wlan0 up; then
+    # Type 1 means wlan0 never left managed mode (803 is monitor mode), so a
+    # failing mode switch must not keep Wi-Fi down.
+    if { [ "$(cat "$NET/type" 2>/dev/null)" != 1 ] && ! "$TOOL" wlan0 mode managed; } ||
+        ! ifconfig wlan0 up; then
         echo "Managed-mode recovery failed; leaving the timer available to retry" >&2
         rmdir "$LOCK"
         return 1
@@ -29,11 +33,13 @@ restore() {
     echo "Recovery commands issued; association and DHCP may take a few seconds"
 }
 if [ "${1:-}" = --restore ]; then restore; exit; fi
-[ -x "$TOOL" ] && [ -x "$WPA" ]
+# Separate checks: under set -e a failing test left of && would not stop the script.
+[ -x "$TOOL" ] || { echo "missing $TOOL" >&2; exit 1; }
+[ -x "$WPA" ] || { echo "missing $WPA" >&2; exit 1; }
 # This experiment is intentionally limited to an already-connected wlan0.
 pgrep wpa_supplicant >/dev/null
 pgrep udhcpc >/dev/null
-[ "$(cat /sys/class/net/wlan0/type)" = 1 ]
+[ "$(cat "$NET/type")" = 1 ]
 [ ! -e "$LOCK" ] || { echo "Recovery lock exists; inspect the previous run first"; exit 1; }
 # Independent recovery still runs if the capture process stalls. The lock keeps
 # the watchdog and normal cleanup from starting duplicate network clients.

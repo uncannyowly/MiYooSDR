@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Package existing ARM builds; run ./build.sh [VERSION] to compile first."""
+"""Package existing ARM builds; run ./build.sh [VERSION] to compile first.
+The version defaults to the VERSION file."""
 import argparse
 import hashlib
 from pathlib import Path
@@ -21,6 +22,7 @@ def package(version):
     if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?", version):
         raise ValueError("version must be X.Y.Z with an optional prerelease suffix")
     # Explicit allowlist: never ship local captures, settings, keys, or logs.
+    # Names are relative to App/MiYooSDR; "../MiYooSDR Replay/..." is the second app.
     files = {
         "miyoosdr": "build/miyoo/miyoosdr",
         "config.json": "app/MiYooSDR/config.json",
@@ -35,6 +37,9 @@ def package(version):
         "docs/driver-research.md": "docs/driver-research.md",
         "docs/screenshot.png": "docs/screenshot.png",
         f"docs/releases/{version}.md": f"docs/releases/{version}.md",
+        "../MiYooSDR Replay/config.json": "app/MiYooSDR Replay/config.json",
+        "../MiYooSDR Replay/icon.png": "app/MiYooSDR Replay/icon.png",
+        "../MiYooSDR Replay/launch.sh": "app/MiYooSDR Replay/launch.sh",
     }
     for name in ("miyoosdr", "research/miyoo-pcap"):
         header = (ROOT / files[name]).read_bytes()[:20]
@@ -52,18 +57,19 @@ def package(version):
     timestamp = time.gmtime(max(315532800, int(git("log", "-1", "--format=%ct"))))[:6]
     output = ROOT / "dist" / f"miyoosdr-{version}.zip"
     output.parent.mkdir(parents=True, exist_ok=True)
-    executable = {"miyoosdr", "launch.sh", "research/miyoo-pcap",
-                  "research/monitor-capture.sh", "research/inspect-capture.py"}
+    executable = {"miyoosdr", "launch.sh", "research/miyoo-pcap", "research/monitor-capture.sh",
+                  "research/inspect-capture.py", "../MiYooSDR Replay/launch.sh"}
     payloads = {name: (ROOT / path).read_bytes() for name, path in files.items()}
     payloads["BUILD.txt"] = build_info.encode()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, payload in sorted(payloads.items()):
-            entry = zipfile.ZipInfo(f"App/MiYooSDR/{name}", date_time=timestamp)
+            path = name[3:] if name.startswith("../") else f"MiYooSDR/{name}"
+            entry = zipfile.ZipInfo(f"App/{path}", date_time=timestamp)
             entry.create_system = 3
             mode = 0o755 if name in executable else 0o644
             entry.external_attr = (stat.S_IFREG | mode) << 16
             entry.compress_type = zipfile.ZIP_DEFLATED
-            archive.writestr(entry, payload)
+            archive.writestr(entry, payload, compresslevel=9)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     checksum = output.with_suffix(".zip.sha256")
     checksum.write_text(f"{digest}  {output.name}\n")
@@ -73,5 +79,5 @@ def package(version):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("version", nargs="?", default="0.5.0")
+    parser.add_argument("version", nargs="?", default=(ROOT / "VERSION").read_text().strip())
     package(parser.parse_args().version)

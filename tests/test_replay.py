@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Exercise offline playback through the real executable without radio hardware."""
+import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -75,15 +77,18 @@ class ReplayTests(unittest.TestCase):
     def test_launcher_executes_offline_path_before_network_setup(self):
         launcher = self.path / "launch.sh"
         launcher.write_text((ROOT / "app/MiYooSDR/launch.sh").read_text())
-        stub = self.path / "miyoosdr"
-        stub.write_text('#!/bin/sh\nprintf "offline playback: %s\\n" "$*"\n')
-        stub.chmod(0o755)
-        for option in ("--replay", "--review"):
-            result = subprocess.run(["sh", str(launcher), option, "sample.pcap"],
-                                    capture_output=True, text=True, timeout=5)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn(f"offline playback: {option} sample.pcap", result.stdout)
-            self.assertFalse((self.path / "miyoosdr.log").exists())
+        shutil.copy(BINARY, self.path / "miyoosdr")
+        env = dict(os.environ, MIYOOSDR_FB="/nonexistent/fb", MIYOOSDR_INPUT="/nonexistent/input")
+        result = subprocess.run(["sh", str(launcher), "--replay", "sample.pcap", "--shot", "out.png"],
+                                capture_output=True, text=True, timeout=10, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.path / "out.png").exists())
+        # Interactive review gets as far as looking for a screen, without Wi-Fi setup.
+        result = subprocess.run(["sh", str(launcher), "--review"], capture_output=True, text=True,
+                                timeout=10, env=env)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("no framebuffer", result.stderr)
+        self.assertFalse((self.path / "miyoosdr.log").exists())
 
 
 if __name__ == "__main__":

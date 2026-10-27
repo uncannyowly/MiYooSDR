@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Draw the Onion app icon: a small spectrum trace over a waterfall."""
+"""Draw the Onion app icon: a small spectrum trace over a waterfall.
+mkicon.py OUT.png [--replay] (--replay adds the play badge of MiYooSDR Replay)."""
 import math
 import random
 import sys
@@ -26,4 +27,7 @@ for x in range(8, 67):
         + 0.35 * math.exp(-((x - 22) / 6.0) ** 2)
     pts.append((x, 36 - level * 24))
 d.line(pts, fill=(61, 220, 132, 255), width=2)
+if "--replay" in sys.argv[2:]:
+    d.rounded_rectangle([5, 5, 29, 29], radius=6, fill=(255, 204, 51, 255))
+    d.polygon([(13, 10), (13, 24), (25, 17)], fill=(14, 20, 28, 255))
 img.save(sys.argv[1])

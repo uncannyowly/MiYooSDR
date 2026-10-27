@@ -15,23 +15,29 @@
  *
  * Views: full band = channels 1, 5, 9, 13, middle 20 MHz of each (tones -32..31
  * at 128 points), 256 bins over 2402.0 .. 2481.7 MHz. Zoom = one channel, 128
- * bins at 256/512/1024 points: 20, 10 or 5 MHz wide around the cursor.
+ * bins at 256/512/1024 points: 20, 10 or 5 MHz wide around the cursor. Bin i is
+ * the FFT tone centred at f0 + i * bw MHz.
  *
- * Modes: (none) = app on /dev/fb0; --dump N = N sweeps as text; --probe = PSD
- * latency per FFT size; --pm-active = switch off the driver's power saving and
- * exit (launch.sh runs it while still associated); --fake = synthetic radio for
- * the PC build; --shot FILE = render one frame to a PPM and exit; --zoom MHZ LEVEL
- * = start zoomed.
+ * Modes: (none) = app on /dev/fb0; --replay FILE = play a PCAP or a spectrum CSV;
+ * --review = recording browser; --dump N = N sweeps as text; --burst MHZ SEC =
+ * single-channel recorder; --fake = synthetic radio for the PC build; --shot FILE
+ * = render one frame to a PNG or PPM and exit. --help lists them all.
+ * --pm-active switches off the driver's power saving and exits (launch.sh runs
+ * it while still associated); --needs-radio tells launch.sh whether the other
+ * options need the radio, so it only takes Wi-Fi down when they do.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -46,6 +52,10 @@
 
 #include "font.h"
 #include "pcap.h"
+
+#ifndef MIYOOSDR_VERSION
+#define MIYOOSDR_VERSION "dev"
+#endif
 
 #define PROC "/proc/net/rtl8188fu/wlan0/"
 #define MAXBINS 256
@@ -72,6 +82,7 @@ static void spin_us(int us)
 /* A tone whose pitch and loudness track audio_norm (0..1), so you can hear a
  * signal rise as you sweep the cursor over it or walk toward its source. */
 static volatile float audio_norm;
+static volatile int audio_quiet; /* fade the tone out (screens with no level to follow) */
 static int audio_on;
 
 #ifdef MIYOO
@@ -136,7 +147,7 @@ static void *ao_loop(void *arg)
 		if (n < 0) n = 0;
 		if (n > 1) n = 1;
 		thz = 220.0 + n * n * 1600.0; /* 220..1820 Hz, squared so peaks sing */
-		tamp = 0.05 + 0.6 * n;
+		tamp = audio_quiet ? 0.0 : 0.05 + 0.6 * n;
 		for (i = 0; i < AO_FRAMES; i++) {
 			int16_t s;
 			hz += (thz - hz) * 0.001; /* glide to avoid clicks */
@@ -203,8 +214,14 @@ static int audio_start(void)
 	attr.u32FrmNum = 6;
 	attr.u32PtNumPerFrm = AO_FRAMES;
 	attr.u32ChnCnt = 2;
-	if (p_MI_AO_SetPubAttr(AO_DEV, &attr) != 0 || p_MI_AO_Enable(AO_DEV) != 0 || p_MI_AO_EnableChn(AO_DEV, AO_CHN) != 0) {
+	if (p_MI_AO_SetPubAttr(AO_DEV, &attr) != 0 || p_MI_AO_Enable(AO_DEV) != 0) {
 		fprintf(stderr, "audio: MI_AO setup failed (audioserver still running?)\n");
+		return -1;
+	}
+	if (p_MI_AO_EnableChn(AO_DEV, AO_CHN) != 0) {
+		fprintf(stderr, "audio: MI_AO channel setup failed\n");
+		if (p_MI_AO_Disable)
+			p_MI_AO_Disable(AO_DEV);
 		return -1;
 	}
 	vol = system_volume_db();
@@ -215,6 +232,10 @@ static int audio_start(void)
 	ao_running = 1;
 	if (pthread_create(&ao_thread, NULL, ao_loop, NULL) != 0) {
 		ao_running = 0;
+		if (p_MI_AO_DisableChn)
+			p_MI_AO_DisableChn(AO_DEV, AO_CHN);
+		if (p_MI_AO_Disable)
+			p_MI_AO_Disable(AO_DEV);
 		return -1;
 	}
 	return 0;
@@ -273,8 +294,10 @@ static unsigned reg_read32(unsigned addr)
 
 	if (addr != rr_addr) {
 		n = snprintf(b, sizeof(b), "%x 4", addr);
-		if (write(fd_rr_cfg, b, n) != n)
+		if (write(fd_rr_cfg, b, n) != n) {
+			io_error("read_reg address", addr);
 			return 0;
+		}
 		rr_addr = addr;
 	}
 	reg_ops++;
@@ -286,7 +309,11 @@ static unsigned reg_read32(unsigned addr)
 	}
 	b[n] = 0;
 	eq = strchr(b, '=');
-	return eq ? (unsigned)strtoul(eq + 1, NULL, 16) : 0;
+	if (eq == NULL) {
+		io_error("read_reg reply", addr);
+		return 0;
+	}
+	return (unsigned)strtoul(eq + 1, NULL, 16);
 }
 
 static void rf_write(unsigned reg, unsigned val)
@@ -408,6 +435,7 @@ static void pm_restore(void)
 
 static int radio_open(void)
 {
+	long errors;
 	pm_active();
 	spin_us(20000);
 	fd_rr_cfg = open(PROC "read_reg", O_WRONLY);
@@ -416,10 +444,22 @@ static int radio_open(void)
 	fd_mon = open(PROC "monitor", O_WRONLY);
 	if (fd_rr_cfg < 0 || fd_rr < 0 || fd_wr < 0) {
 		fprintf(stderr, "no RTL8188FU proc entries (%s)\n", strerror(errno));
+		pm_restore();
 		return -1;
 	}
+	if (fd_mon < 0 && !raw_tune) { /* the raw RF path once hung the chip's USB link */
+		fprintf(stderr, "no proc monitor entry to tune with; refusing raw RF tuning without --raw-tune\n");
+		pm_restore();
+		return -1;
+	}
+	errors = io_errors;
 	orig_808 = reg_read32(0x808);
 	orig_c50 = reg_read32(0xc50) & 0xff;
+	if (io_errors != errors) { /* zeros here would be written back on exit */
+		fprintf(stderr, "cannot read the PSD registers; leaving the radio alone\n");
+		pm_restore();
+		return -1;
+	}
 	if (!rf_read_dump(0x18, &orig_rf18))
 		orig_rf18 = 0x00c0b;
 	rf18_base = orig_rf18 & ~0xffu;
@@ -520,6 +560,19 @@ static struct view vw;
 
 static double ch_mhz(int ch) { return 2407.0 + 5.0 * ch; }
 
+/* bin i of the view is the FFT tone centred at f0 + i * bw */
+static double bin_mhz(int i) { return vw.f0 + i * vw.bw; }
+
+static int mhz_bin(double f) /* nearest bin, kept inside the view */
+{
+	double i = (f - vw.f0) / vw.bw;
+	if (!(i > 0)) /* also NaN */
+		return 0;
+	if (i >= vw.nb - 1)
+		return vw.nb - 1;
+	return (int)lround(i);
+}
+
 static void view_full(void)
 {
 	memset(&vw, 0, sizeof(vw));
@@ -530,14 +583,23 @@ static void view_full(void)
 	vw.dc_hi = 0;
 }
 
-/* zoom on target MHz, 2.5-7.5 MHz off the LO so the DC leak stays away from it */
+#define BAND_LO 2400.0 /* zoom targets stay inside the 2.4 GHz band */
+#define BAND_HI 2484.0
+
+/* zoom on target MHz, 2.5-7.5 MHz off the LO so the DC leak stays away from it.
+ * The tones stay inside the FFT's +-N/2: beyond that the PSD index wraps and
+ * would show the far side of the LO under these frequency labels. */
 static void view_zoom(double target, int level)
 {
-	int ch, best = 1;
+	int ch, best = 1, half;
 	double bestscore = 1e9;
 
 	if (level < 1) level = 1;
 	if (level > 3) level = 3;
+	if (!(target >= BAND_LO)) /* also NaN */
+		target = BAND_LO;
+	if (target > BAND_HI)
+		target = BAND_HI;
 	for (ch = 1; ch <= 13; ch++) {
 		double off = target - ch_mhz(ch), score = fabs(fabs(off) - 5.0);
 		if (score < bestscore) {
@@ -551,7 +613,12 @@ static void view_zoom(double target, int level)
 	vw.sel = level;
 	vw.bw = 0.3125 / (1 << level);
 	vw.ch = best;
+	half = (128 << level) / 2;
 	vw.tone0 = (int)lround((target - ch_mhz(best)) / vw.bw) - 64;
+	if (vw.tone0 < -half)
+		vw.tone0 = -half;
+	if (vw.tone0 > half - vw.nb)
+		vw.tone0 = half - vw.nb;
 	vw.f0 = ch_mhz(best) + vw.tone0 * vw.bw;
 	{ /* LO leakage covers roughly +-0.7 MHz */
 		int dcw = (int)ceil(0.7 / vw.bw);
@@ -564,7 +631,8 @@ static void view_zoom(double target, int level)
 
 static float sweep_db[MAXBINS], hold_db[MAXBINS], avg_db[MAXBINS], base_db[MAXBINS];
 static unsigned raw_v[MAXBINS];
-static int igi = 0x28, have_hold, have_avg, have_base;
+static int igi = 0x28, sweep_gain = 0x28, have_hold, have_avg, have_base;
+static unsigned view_gen; /* bumped by every view change, so a sweep can tell it was overtaken */
 static long zeros, stuck_sweeps, remedies;
 static char status_msg[200];
 static double status_until;
@@ -574,13 +642,13 @@ static void status(const char *msg);
 static void update_occupancy(void);
 static void burst_reset(void);
 
-static float to_db(unsigned v, float prev)
+static float to_db(unsigned v, float prev, int gain)
 {
 	if (v == 0) { /* occasional dropout: keep the previous reading */
 		zeros++;
 		return prev;
 	}
-	return (float)(10.0 * log10((double)v) + igi);
+	return (float)(10.0 * log10((double)v) + gain);
 }
 
 static void bridge(float *out, int nb, int lo, int hi)
@@ -642,15 +710,19 @@ static void check_stuck(int frozen)
 	status(m);
 }
 
-static void do_sweep(void)
+/* One sweep of the current view, at the gain it started with (L1/R1 apply from
+ * the next sweep). Buttons are read in between; if one changes the view, the
+ * readings so far belong to no view, so they are dropped and this returns 0. */
+static int do_sweep(void)
 {
-	int j, k, frozen = 0;
+	int j, k, frozen = 0, gain = igi;
+	unsigned gen = view_gen;
 
 	if (vw.level == 0) {
 		for (j = 0; j < 4 && !quit; j++) {
 			float *out = sweep_db + j * 64;
 			if (!fake) {
-				set_igi(igi);
+				set_igi(gain);
 				tune(full_ch[j]);
 				(void)psd_point(0, 0); /* settle */
 			}
@@ -658,16 +730,18 @@ static void do_sweep(void)
 				int idx = j * 64 + k + 32;
 				unsigned v = fake ? fake_point(full_ch[j], k, 0) : psd_point(k, 0);
 				raw_v[idx] = v;
-				out[k + 32] = to_db(v, sweeps ? sweep_db[idx] : (float)igi);
+				out[k + 32] = to_db(v, sweeps ? sweep_db[idx] : (float)gain, gain);
 			}
 			bridge(out, 64, 32 - 2, 32 + 2); /* LO leak with notches beside it */
 			frozen += distinct_count(raw_v + j * 64, 64) <= 3;
 			poll_input();
+			if (view_gen != gen)
+				return 0;
 		}
 		frozen = frozen >= 3;
 	} else {
 		if (!fake) {
-			set_igi(igi);
+			set_igi(gain);
 			if (tuned_ch != vw.ch) {
 				tune(vw.ch);
 				(void)psd_point(0, vw.sel);
@@ -676,13 +750,17 @@ static void do_sweep(void)
 		for (k = 0; k < vw.nb && !quit; k++) {
 			unsigned v = fake ? fake_point(vw.ch, vw.tone0 + k, vw.sel) : psd_point(vw.tone0 + k, vw.sel);
 			raw_v[k] = v;
-			sweep_db[k] = to_db(v, sweeps ? sweep_db[k] : (float)igi);
-			if ((k & 31) == 31)
+			sweep_db[k] = to_db(v, sweeps ? sweep_db[k] : (float)gain, gain);
+			if ((k & 31) == 31) {
 				poll_input();
+				if (view_gen != gen)
+					return 0;
+			}
 		}
 		bridge(sweep_db, vw.nb, vw.dc_lo, vw.dc_hi);
 		frozen = distinct_count(raw_v, vw.nb) <= 3;
 	}
+	sweep_gain = gain;
 	check_stuck(frozen);
 	if (fake) /* about the Mini's sweep rates, so timing on the PC looks like the real thing */
 		usleep(vw.level ? 50000 : 200000);
@@ -702,6 +780,7 @@ static void do_sweep(void)
 	if (vw.level == 0)
 		update_occupancy();
 	sweeps++;
+	return 1;
 }
 
 /* one log line: raw PSD spread of the last sweep plus chip state */
@@ -798,6 +877,9 @@ static uint32_t lut[256];
 
 static int bin_x(int i) { return PX0 + i * PW / vw.nb; }
 
+/* x of frequency f: bin i fills bin_x(i)..bin_x(i + 1) with its tone in the middle */
+static int mhz_x(double f) { return PX0 + (int)lround(((f - vw.f0) / vw.bw + 0.5) * PW / vw.nb); }
+
 /* colour palettes: five {pos,r,g,b} stops each (0..1), shared by the filled
  * spectrum and the waterfall */
 #define NPAL 4
@@ -862,14 +944,18 @@ static int db_to_y(float db)
 	return SY0 + SHGT - 1 - (int)(t * (SHGT - 1));
 }
 
+static uint8_t wf_level(float db, int i) /* waterfall colour index of a reading in bin i */
+{
+	float t = enhance ? (db - base_db[i]) / 24.0f : (db - db_low) / DB_SPAN;
+	return (uint8_t)(t < 0 ? 0 : t > 1 ? 255 : t * 255);
+}
+
 static void push_waterfall(void)
 {
 	int i;
 	wf_head = (wf_head + WHGT - 1) % WHGT;
-	for (i = 0; i < vw.nb; i++) {
-		float t = enhance ? (sweep_db[i] - base_db[i]) / 24.0f : (sweep_db[i] - db_low) / DB_SPAN;
-		wf[wf_head][i] = (uint8_t)(t < 0 ? 0 : t > 1 ? 255 : t * 255);
-	}
+	for (i = 0; i < vw.nb; i++)
+		wf[wf_head][i] = wf_level(sweep_db[i], i);
 	if (wf_rows < WHGT)
 		wf_rows++;
 }
@@ -909,8 +995,8 @@ static void draw_band_tint(void)
 	if (vw.level != 0)
 		return;
 	for (c = 0; c < 3; c++) {
-		int xa = PX0 + (int)((ch_mhz(band_chs[c]) - 11.0 - vw.f0) / vw.bw * PW / vw.nb);
-		int xb = PX0 + (int)((ch_mhz(band_chs[c]) + 11.0 - vw.f0) / vw.bw * PW / vw.nb);
+		int xa = mhz_x(ch_mhz(band_chs[c]) - 11.0);
+		int xb = mhz_x(ch_mhz(band_chs[c]) + 11.0);
 		if (xa < PX0) xa = PX0;
 		if (xb > PX0 + PW) xb = PX0 + PW;
 		for (y = SY0; y < SY0 + SHGT; y++)
@@ -958,7 +1044,7 @@ static void update_occupancy(void)
 		float sum = 0, mx = 0;
 		int cnt = 0;
 		for (i = 0; i < vw.nb; i++) {
-			double f = vw.f0 + (i + 0.5) * vw.bw;
+			double f = bin_mhz(i);
 			if (f >= c - 10 && f <= c + 10) {
 				float e = sweep_db[i] - base_db[i];
 				sum += e;
@@ -1155,7 +1241,9 @@ static void render(void)
 	/* frequency grid */
 	step = vw.level == 0 ? 10 : vw.level == 1 ? 2 : vw.level == 2 ? 1 : 0.5;
 	for (f = ceil(vw.f0 / step) * step; f < vw.f0 + span; f += step) {
-		x = PX0 + (int)((f - vw.f0) / vw.bw * PW / vw.nb);
+		x = mhz_x(f);
+		if (x >= PX0 + PW)
+			break;
 		line(x, SY0, x, SY0 + SHGT - 1, C_GRID);
 		/* label every other grid line when zoomed */
 		if (vw.level == 0 || fmod(f / step + 0.25, 2.0) < 0.5) {
@@ -1166,7 +1254,7 @@ static void render(void)
 	if (vw.level == 0) {
 		static const int chs[3] = { 1, 6, 11 };
 		for (i = 0; i < 3; i++) {
-			x = PX0 + (int)((ch_mhz(chs[i]) - vw.f0) / vw.bw * PW / vw.nb);
+			x = mhz_x(ch_mhz(chs[i]));
 			snprintf(s, sizeof(s), "ch%d", chs[i]);
 			text(x - 12, SY0 + SHGT + 18, C_AXIS, s);
 		}
@@ -1176,7 +1264,7 @@ static void render(void)
 	}
 
 	/* spectrum */
-	if (sweeps) {
+	if (sweeps || in_review) {
 		if (spec_style == 0) {
 			for (i = 1; i < vw.nb; i++)
 				line(bin_x(i - 1), db_to_y(shown(sweep_db, i - 1)), bin_x(i), db_to_y(shown(sweep_db, i)), C_LIVE);
@@ -1199,7 +1287,7 @@ static void render(void)
 		for (i = 0; i < 3; i++) {
 			if (adv_mhz[i] < vw.f0 || adv_mhz[i] >= vw.f0 + span)
 				continue;
-			x = PX0 + (int)((adv_mhz[i] - vw.f0) / vw.bw * PW / vw.nb);
+			x = mhz_x(adv_mhz[i]);
 			fill(x - 1, SY0 + SHGT - 7, 3, 7, C_HOLD);
 			if (vw.level == 0)
 				text(x - 12, SY0 + SHGT + 18, cscale(C_HOLD, 0.7f), "adv");
@@ -1212,9 +1300,9 @@ static void render(void)
 	x = bin_x(cursor) + PW / vw.nb / 2;
 	for (y = SY0; y < SY0 + SHGT; y += 3)
 		canvas[y * SW + x] = C_CURSOR;
-	snprintf(s, sizeof(s), vw.level ? "%.2f" : "%.1f", vw.f0 + (cursor + 0.5) * vw.bw);
+	snprintf(s, sizeof(s), vw.level ? "%.2f" : "%.1f", bin_mhz(cursor));
 	text(PX0 + PW + 6, SY0 + 2, C_CURSOR, s);
-	if (sweeps) {
+	if (sweeps || in_review) {
 		snprintf(s, sizeof(s), enhance ? "now%+4.0f" : "now %3.0f", shown(sweep_db, cursor));
 		text(PX0 + PW + 6, SY0 + 22, C_LIVE, s);
 		snprintf(s, sizeof(s), enhance ? "max%+4.0f" : "max %3.0f", shown(hold_db, cursor));
@@ -1228,7 +1316,7 @@ static void render(void)
 
 	/* what the cursor frequency is used for */
 	{
-		double fc = vw.f0 + (cursor + 0.5) * vw.bw;
+		double fc = bin_mhz(cursor);
 		int adv = 0, b = ble_channel(fc, &adv), w = wifi_channel(fc), z = zigbee_channel(fc), yy = SY0 + 122;
 		if (b >= 0) {
 			snprintf(s, sizeof(s), adv ? "ADV %d" : "BLE %d", b);
@@ -1265,8 +1353,9 @@ static void render(void)
 		text(PX0 + PW + 6, WY0, C_DIM, "newest");
 		text(PX0 + PW + 6, WY0 + WHGT - 16, C_DIM, "older");
 	}
-	if (!in_review)
-		draw_bursts();
+	if (in_review) /* review draws its own title and footer */
+		return;
+	draw_bursts();
 
 	/* help / status line (80 characters fit) */
 	if (sel_down)
@@ -1287,14 +1376,159 @@ static struct fb_var_screeninfo var, orig_var;
 static struct fb_fix_screeninfo fix;
 #endif
 static int in_fd = -1;
+static uint32_t keys_down[4]; /* key codes 0..127 currently held */
+
+#define KEY_SHIFTED 0x10000 /* next_key(): pressed while SELECT is held */
+
+/* Every screen reads buttons through here. Returns the next press, or -1 when
+ * there is none. Holding a key repeats only for the d-pad and L1/R1, so holding
+ * X does not toggle recording on and off. SELECT is a shift layer: keys pressed
+ * while it is held come back with KEY_SHIFTED, and a tap on its own comes back
+ * as KEY_RIGHTCTRL when it is released. */
+static int next_key(void)
+{
+#ifdef __linux__
+	static struct input_event ev[16];
+	static int n, k;
+	while (in_fd >= 0) {
+		const struct input_event *e;
+		int code, val;
+		if (k >= n) {
+			ssize_t got = read(in_fd, ev, sizeof(ev));
+			if (got <= 0)
+				return -1;
+			n = (int)(got / (ssize_t)sizeof(ev[0]));
+			k = 0;
+		}
+		e = &ev[k++];
+		code = e->code;
+		val = e->value;
+		if (e->type != EV_KEY)
+			continue;
+		if (code < 128) {
+			if (val)
+				keys_down[code >> 5] |= 1u << (code & 31);
+			else
+				keys_down[code >> 5] &= ~(1u << (code & 31));
+		}
+		if (code == KEY_RIGHTCTRL) {
+			if (val == 1) {
+				sel_down = 1;
+				sel_combo = 0;
+			} else if (val == 0) {
+				sel_down = 0;
+				if (!sel_combo)
+					return KEY_RIGHTCTRL;
+			}
+			continue;
+		}
+		if (val == 0 || (val == 2 && code != KEY_UP && code != KEY_DOWN && code != KEY_LEFT &&
+		                 code != KEY_RIGHT && code != KEY_E && code != KEY_T))
+			continue;
+		if (sel_down) {
+			sel_combo = 1;
+			return code | KEY_SHIFTED;
+		}
+		return code;
+	}
+#endif
+	return -1;
+}
+
+/* Sleep until a button is pressed or max_s seconds pass (signals end it too). */
+static void wait_input(double max_s)
+{
+	struct pollfd p;
+	int ms = max_s <= 0 ? 0 : (int)(max_s * 1000 + 0.5);
+	if (in_fd < 0) {
+		usleep((useconds_t)ms * 1000);
+		return;
+	}
+	p.fd = in_fd;
+	p.events = POLLIN;
+	p.revents = 0;
+	poll(&p, 1, ms);
+}
+
+/* Launched over SSH while Onion's MainUI is up, the app would share the screen
+ * and the buttons with it: A in a replay would also start MainUI's highlighted
+ * game. So MainUI is paused and the buttons grabbed while the app has the screen,
+ * and both are handed back on exit, the screen as MainUI left it. A normal launch
+ * from Onion's menu finds no MainUI running and changes nothing. */
+static pid_t ui_pid;
+static uint8_t *fb_saved;
+static int in_grabbed;
+
+static pid_t find_process(const char *name)
+{
+	DIR *d = opendir("/proc");
+	struct dirent *e;
+	pid_t found = 0;
+	if (d == NULL)
+		return 0;
+	while (!found && (e = readdir(d)) != NULL) {
+		char path[300], comm[64];
+		FILE *f;
+		if (e->d_name[0] < '1' || e->d_name[0] > '9')
+			continue;
+		snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+		if ((f = fopen(path, "r")) == NULL)
+			continue;
+		if (fgets(comm, sizeof(comm), f) != NULL) {
+			comm[strcspn(comm, "\n")] = 0;
+			if (!strcmp(comm, name))
+				found = (pid_t)atoi(e->d_name);
+		}
+		fclose(f);
+	}
+	closedir(d);
+	return found;
+}
+
+static void ui_resume(void)
+{
+	if (ui_pid > 0) {
+		kill(ui_pid, SIGCONT);
+		fprintf(stderr, "MainUI resumed\n");
+		ui_pid = 0;
+	}
+}
+
+static void on_fatal(int sig) /* never leave MainUI frozen */
+{
+	if (ui_pid > 0)
+		kill(ui_pid, SIGCONT);
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
 
 static int fb_open(void)
 {
 #ifdef __linux__
-	fb_fd = open("/dev/fb0", O_RDWR);
-	if (fb_fd < 0 || ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) < 0)
+	const char *fb_path = getenv("MIYOOSDR_FB"), *in_path = getenv("MIYOOSDR_INPUT");
+	static const int fatal[] = { SIGSEGV, SIGBUS, SIGABRT, SIGFPE, SIGILL };
+	unsigned i;
+
+	fb_fd = open(fb_path ? fb_path : "/dev/fb0", O_RDWR);
+	if (fb_fd < 0)
 		return -1;
+	ui_pid = find_process("MainUI");
+	if (ui_pid > 0) {
+		for (i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++)
+			signal(fatal[i], on_fatal);
+		kill(ui_pid, SIGSTOP);
+	}
+	if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) < 0 || ioctl(fb_fd, FBIOGET_FSCREENINFO, &fix) < 0)
+		goto fail;
 	orig_var = var;
+	fb_size = fix.smem_len;
+	fb_mem = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
+	if (fb_mem == MAP_FAILED) {
+		fb_mem = NULL;
+		goto fail;
+	}
+	if (ui_pid > 0 && (fb_saved = malloc(fb_size)) != NULL) /* before the mode change can touch it */
+		memcpy(fb_saved, fb_mem, fb_size);
 	var.bits_per_pixel = 32;
 	var.yres_virtual = var.yres * 2;
 	var.yoffset = 0;
@@ -1304,19 +1538,44 @@ static int fb_open(void)
 	}
 	if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &var) < 0 || ioctl(fb_fd, FBIOGET_FSCREENINFO, &fix) < 0 ||
 	    var.bits_per_pixel != 32)
-		return -1;
-	fb_size = fix.smem_len;
-	fb_mem = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
-	if (fb_mem == MAP_FAILED) {
-		fb_mem = NULL;
-		return -1;
+		goto fail;
+	if (fix.smem_len != fb_size) { /* the mode change moved the buffer */
+		munmap(fb_mem, fb_size);
+		free(fb_saved);
+		fb_saved = NULL;
+		fb_size = fix.smem_len;
+		fb_mem = mmap(NULL, fb_size, PROT_READ | PROT_WRITE, MAP_SHARED, fb_fd, 0);
+		if (fb_mem == MAP_FAILED) {
+			fb_mem = NULL;
+			goto fail;
+		}
 	}
 	pages = (var.yres_virtual >= var.yres * 2 && fb_size >= (size_t)fix.line_length * var.yres * 2) ? 2 : 1;
-	in_fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+	in_fd = open(in_path ? in_path : "/dev/input/event0", O_RDONLY | O_NONBLOCK);
+	if (ui_pid > 0 && in_fd >= 0 && ioctl(in_fd, EVIOCGRAB, 1) == 0)
+		in_grabbed = 1;
+	if (ui_pid > 0)
+		fprintf(stderr, "MainUI (pid %d) paused%s while MiYooSDR has the screen\n", (int)ui_pid,
+		        in_grabbed ? ", buttons grabbed" : "");
 	return 0;
+fail:
+	if (fb_mem) {
+		ioctl(fb_fd, FBIOPUT_VSCREENINFO, &orig_var);
+		munmap(fb_mem, fb_size);
+		fb_mem = NULL;
+	}
+	free(fb_saved);
+	fb_saved = NULL;
+	ui_resume();
+	return -1;
 #else
 	return -1;
 #endif
+}
+
+static int keys_held(void)
+{
+	return (keys_down[0] | keys_down[1] | keys_down[2] | keys_down[3]) != 0;
 }
 
 static void fb_close(void)
@@ -1327,28 +1586,47 @@ static void fb_close(void)
 		var.yoffset = 0;
 		ioctl(fb_fd, FBIOPAN_DISPLAY, &var);
 		ioctl(fb_fd, FBIOPUT_VSCREENINFO, &orig_var);
+		if (fb_saved) /* MainUI's own frame, so it looks as it did when paused */
+			memcpy(fb_mem, fb_saved, fb_size);
 		munmap(fb_mem, fb_size);
+		fb_mem = NULL;
 	}
+	free(fb_saved);
+	fb_saved = NULL;
+	if (in_grabbed) { /* let go only once the buttons are up, or MainUI gets a stray release */
+		double until = now_s() + 1.5;
+		while (keys_held() && now_s() < until) {
+			wait_input(0.05);
+			while (next_key() >= 0)
+				;
+		}
+		ioctl(in_fd, EVIOCGRAB, 0);
+		in_grabbed = 0;
+	}
+	ui_resume();
 #endif
 }
 
 static void present(void)
 {
 #ifdef __linux__
-	int target = pages == 2 ? page ^ 1 : 0, y, x;
+	int target = pages == 2 ? page ^ 1 : 0, y, x, w, h;
 	int ox = ((int)var.xres - SW) / 2, oy = ((int)var.yres - SH) / 2;
+	size_t stride = fix.line_length;
 	uint8_t *base;
 
 	if (!fb_mem)
 		return;
 	if (ox < 0) ox = 0;
 	if (oy < 0) oy = 0;
-	base = fb_mem + (size_t)target * var.yres * fix.line_length;
+	w = (int)var.xres - ox < SW ? (int)var.xres - ox : SW;
+	h = (int)var.yres - oy < SH ? (int)var.yres - oy : SH;
+	base = fb_mem + (size_t)target * var.yres * stride;
 	/* the panel is mounted upside down: rotate 180 degrees */
-	for (y = 0; y < SH && y + oy < (int)var.yres; y++) {
+	for (y = 0; y < h; y++) {
 		const uint32_t *src = canvas + (size_t)(SH - 1 - y) * SW + SW - 1;
-		uint32_t *dst = (uint32_t *)(base + (size_t)(y + oy) * fix.line_length) + ox;
-		for (x = 0; x < SW && x + ox < (int)var.xres; x++)
+		uint32_t *dst = (uint32_t *)(base + (size_t)(y + oy) * stride) + ox;
+		for (x = 0; x < w; x++)
 			dst[x] = *src-- | 0xFF000000u;
 	}
 	if (pages == 2) {
@@ -1362,19 +1640,155 @@ static void present(void)
 static int write_ppm(const char *path)
 {
 	FILE *f = fopen(path, "wb");
-	int i;
+	unsigned char row[SW * 3];
+	int x, y, ok;
 	if (!f)
 		return -1;
-	fprintf(f, "P6\n%d %d\n255\n", SW, SH);
-	for (i = 0; i < SW * SH; i++) {
-		unsigned char px[3] = { canvas[i] >> 16, canvas[i] >> 8, canvas[i] };
-		fwrite(px, 1, 3, f);
+	ok = fprintf(f, "P6\n%d %d\n255\n", SW, SH) > 0;
+	for (y = 0; ok && y < SH; y++) {
+		for (x = 0; x < SW; x++) {
+			uint32_t c = canvas[y * SW + x];
+			row[3 * x] = (unsigned char)(c >> 16);
+			row[3 * x + 1] = (unsigned char)(c >> 8);
+			row[3 * x + 2] = (unsigned char)c;
+		}
+		ok = fwrite(row, 1, sizeof(row), f) == sizeof(row);
 	}
-	fclose(f);
-	return 0;
+	if (fclose(f) != 0)
+		ok = 0;
+	return ok ? 0 : -1;
 }
 
-/* PNG with stored (uncompressed) deflate blocks: opens on any phone or PC, no zlib */
+/* PNG: zlib stream holding one fixed-Huffman deflate block (RFC 1951) with LZ77
+ * matches. Screens are mostly flat colour, so trying the previous pixel and the
+ * previous row besides a hash of the next three bytes finds nearly every match.
+ * No zlib needed, and the bytes come out the same on the PC and the Miyoo. */
+struct bit_out {
+	uint8_t *p;
+	uint32_t acc;
+	int n;
+};
+
+static void put_bits(struct bit_out *w, uint32_t v, int n)
+{
+	w->acc |= v << w->n;
+	w->n += n;
+	while (w->n >= 8) {
+		*w->p++ = (uint8_t)w->acc;
+		w->acc >>= 8;
+		w->n -= 8;
+	}
+}
+
+static void put_code(struct bit_out *w, uint32_t code, int len) /* Huffman codes go MSB first */
+{
+	uint32_t r = 0;
+	int i;
+	for (i = 0; i < len; i++)
+		r |= ((code >> i) & 1u) << (len - 1 - i);
+	put_bits(w, r, len);
+}
+
+static void put_symbol(struct bit_out *w, int v)
+{
+	if (v < 144)
+		put_code(w, 0x30 + v, 8);
+	else if (v < 256)
+		put_code(w, 0x190 + v - 144, 9);
+	else if (v < 280)
+		put_code(w, v - 256, 7);
+	else
+		put_code(w, 0xc0 + v - 280, 8);
+}
+
+static void put_match(struct bit_out *w, int len, int dist)
+{
+	static const uint16_t len_base[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31,
+	                                       35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+	static const uint8_t len_extra[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2,
+	                                       3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+	static const uint16_t dist_base[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257,
+	                                        385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193,
+	                                        12289, 16385, 24577 };
+	static const uint8_t dist_extra[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7,
+	                                        8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+	int c = 28, d = 29;
+	while (len_base[c] > len)
+		c--;
+	put_symbol(w, 257 + c);
+	put_bits(w, (uint32_t)(len - len_base[c]), len_extra[c]);
+	while (dist_base[d] > dist)
+		d--;
+	put_code(w, (uint32_t)d, 5);
+	put_bits(w, (uint32_t)(dist - dist_base[d]), dist_extra[d]);
+}
+
+#define LZ_HASH_BITS 15
+
+/* Deflate n bytes of rows `stride` long into dst (room for n + n / 8 + 16 bytes). */
+static size_t deflate_fixed(const uint8_t *src, uint32_t n, uint32_t stride, uint8_t *dst)
+{
+	int32_t *head = malloc(sizeof(int32_t) << LZ_HASH_BITS);
+	struct bit_out w = { dst, 0, 0 };
+	uint32_t i = 0;
+	if (head == NULL)
+		return 0;
+	memset(head, 0xff, sizeof(int32_t) << LZ_HASH_BITS);
+	put_bits(&w, 1, 1); /* BFINAL */
+	put_bits(&w, 1, 2); /* BTYPE 01: fixed Huffman codes */
+	while (i < n) {
+		int best = 0, bestd = 0, c;
+		if (i + 3 <= n) {
+			uint32_t h = ((uint32_t)src[i] << 16 | (uint32_t)src[i + 1] << 8 | src[i + 2]) * 2654435761u >>
+			             (32 - LZ_HASH_BITS);
+			int64_t cand[3];
+			cand[0] = head[h];
+			cand[1] = (int64_t)i - 3;
+			cand[2] = (int64_t)i - stride;
+			head[h] = (int32_t)i;
+			for (c = 0; c < 3; c++) {
+				uint32_t from, max = n - i < 258 ? n - i : 258, len = 0;
+				if (cand[c] < 0 || i - cand[c] > 32768)
+					continue;
+				from = (uint32_t)cand[c];
+				while (len < max && src[from + len] == src[i + len])
+					len++;
+				if ((int)len > best) {
+					best = (int)len;
+					bestd = (int)(i - from);
+				}
+			}
+		}
+		if (best >= 3) {
+			put_match(&w, best, bestd);
+			i += (uint32_t)best;
+		} else {
+			put_symbol(&w, src[i++]);
+		}
+	}
+	put_symbol(&w, 256); /* end of block */
+	if (w.n)
+		*w.p++ = (uint8_t)w.acc;
+	free(head);
+	return (size_t)(w.p - dst);
+}
+
+static uint32_t adler32(const uint8_t *p, uint32_t n)
+{
+	uint32_t a = 1, b = 0;
+	while (n) { /* 5552 bytes cannot overflow the sums before reducing them */
+		uint32_t k = n < 5552 ? n : 5552;
+		n -= k;
+		while (k--) {
+			a += *p++;
+			b += a;
+		}
+		a %= 65521;
+		b %= 65521;
+	}
+	return b << 16 | a;
+}
+
 static uint32_t crc_tab[256];
 
 static uint32_t crc32_update(uint32_t c, const uint8_t *p, size_t n)
@@ -1421,10 +1835,10 @@ static void png_chunk(FILE *f, const char *type, const uint8_t *data, uint32_t l
 static int write_png(const char *path)
 {
 	static const uint8_t sig[8] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
-	const uint32_t row = 1 + SW * 3, raw = row * SH, nblk = (raw + 65534) / 65535;
-	uint8_t *rb = malloc(raw), *z = malloc(2 + raw + 5 * nblk + 4), *p, ihdr[13];
-	uint32_t a = 1, b = 0, done = 0, i;
-	int x, y, ok = -1;
+	const uint32_t row = 1 + SW * 3, raw = row * SH;
+	uint8_t *rb = malloc(raw), *z = malloc(2 + raw + raw / 8 + 16 + 4), *p, ihdr[13];
+	size_t zn;
+	int x, y, ok = -1, failed;
 	FILE *f;
 
 	if (!rb || !z)
@@ -1439,25 +1853,14 @@ static int write_png(const char *path)
 			*r++ = (uint8_t)c;
 		}
 	}
-	for (i = 0; i < raw; i++) { /* zlib's Adler-32 */
-		a = (a + rb[i]) % 65521;
-		b = (b + a) % 65521;
-	}
 	p = z;
 	*p++ = 0x78; /* zlib header: deflate, 32 KB window */
 	*p++ = 0x01;
-	while (done < raw) {
-		uint32_t n = raw - done > 65535 ? 65535 : raw - done;
-		*p++ = (uint8_t)(done + n == raw); /* BFINAL, BTYPE 00 (stored) */
-		*p++ = (uint8_t)n;
-		*p++ = (uint8_t)(n >> 8);
-		*p++ = (uint8_t)~n;
-		*p++ = (uint8_t)(~n >> 8);
-		memcpy(p, rb + done, n);
-		p += n;
-		done += n;
-	}
-	put_be32(p, b << 16 | a);
+	zn = deflate_fixed(rb, raw, row, p);
+	if (zn == 0)
+		goto out;
+	p += zn;
+	put_be32(p, adler32(rb, raw));
 	p += 4;
 	f = fopen(path, "wb");
 	if (!f)
@@ -1471,7 +1874,8 @@ static int write_png(const char *path)
 	png_chunk(f, "IHDR", ihdr, 13);
 	png_chunk(f, "IDAT", z, (uint32_t)(p - z));
 	png_chunk(f, "IEND", NULL, 0);
-	ok = fclose(f) == 0 ? 0 : -1;
+	failed = ferror(f);
+	ok = fclose(f) == 0 && !failed ? 0 : -1;
 out:
 	free(rb);
 	free(z);
@@ -1486,16 +1890,32 @@ static int write_image(const char *path)
 
 static void status(const char *msg);
 
-/* START: shots/sdr-YYYYMMDD-HHMMSS.png, so screenshots do not overwrite each other */
+/* dir/prefix-YYYYMMDD-HHMMSS.ext, with -2, -3 ... added when that second is
+ * taken, so quick repeats never overwrite each other */
+static void timestamped_name(char *out, size_t n, const char *dir, const char *prefix, const char *ext)
+{
+	time_t t = time(NULL);
+	struct tm tm;
+	struct stat st;
+	int k;
+	localtime_r(&t, &tm);
+	mkdir(dir, 0755);
+	for (k = 1; k < 100; k++) {
+		char suffix[8] = "";
+		if (k > 1)
+			snprintf(suffix, sizeof(suffix), "-%d", k);
+		snprintf(out, n, "%s/%s-%04d%02d%02d-%02d%02d%02d%s.%s", dir, prefix, tm.tm_year + 1900, tm.tm_mon + 1,
+		         tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, suffix, ext);
+		if (stat(out, &st) != 0)
+			return;
+	}
+}
+
+/* START: shots/sdr-<date>-<time>.png */
 static void save_screenshot(void)
 {
 	char name[96], m[128];
-	time_t t = time(NULL);
-	struct tm tm;
-	localtime_r(&t, &tm);
-	mkdir("shots", 0755);
-	snprintf(name, sizeof(name), "shots/sdr-%04d%02d%02d-%02d%02d%02d.png", tm.tm_year + 1900, tm.tm_mon + 1,
-	         tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+	timestamped_name(name, sizeof(name), "shots", "sdr", "png");
 	if (write_png(name) == 0) {
 		sync();
 		snprintf(m, sizeof(m), "screenshot saved: %s", name);
@@ -1515,8 +1935,7 @@ static void settings_save(void)
 	fprintf(f, "# MiYooSDR settings, written on exit\n");
 	fprintf(f, "palette=%d\nstyle=%d\npanel=%d\nenhance=%d\nhold=%d\n", palette, spec_style, disp_mode, enhance,
 	        show_hold);
-	fprintf(f, "zoom=%d\nzoom_mhz=%.4f\ncursor_mhz=%.4f\n", vw.level, vw.f0 + vw.nb * vw.bw / 2,
-	        vw.f0 + (cursor + 0.5) * vw.bw);
+	fprintf(f, "zoom=%d\nzoom_mhz=%.4f\ncursor_mhz=%.4f\n", vw.level, bin_mhz(vw.nb / 2), bin_mhz(cursor));
 	fclose(f);
 	sync();
 }
@@ -1544,8 +1963,8 @@ static void settings_load(void)
 	fclose(f);
 	if (zoom && zoom_mhz > 2395 && zoom_mhz < 2490)
 		view_zoom(zoom_mhz, zoom);
-	if (cursor_mhz > vw.f0 && cursor_mhz < vw.f0 + vw.nb * vw.bw)
-		cursor = (int)((cursor_mhz - vw.f0) / vw.bw);
+	if (cursor_mhz >= bin_mhz(0) - vw.bw / 2 && cursor_mhz <= bin_mhz(vw.nb - 1) + vw.bw / 2)
+		cursor = mhz_bin(cursor_mhz);
 }
 
 static void status(const char *msg)
@@ -1570,14 +1989,7 @@ static void toggle_rec(void)
 		status("recording saved");
 		return;
 	}
-	mkdir("rec", 0755);
-	{
-		time_t t = time(NULL);
-		struct tm tm;
-		localtime_r(&t, &tm);
-		snprintf(rec_name, sizeof(rec_name), "rec/sdr-%04d%02d%02d-%02d%02d%02d.csv", tm.tm_year + 1900,
-		         tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
-	}
+	timestamped_name(rec_name, sizeof(rec_name), "rec", "sdr", "csv");
 	rec = fopen(rec_name, "w");
 	if (!rec) {
 		status("cannot open recording file");
@@ -1595,7 +2007,7 @@ static void record_sweep(double t0)
 	int i;
 	if (!rec)
 		return;
-	fprintf(rec, "%.3f,%d,%d", now_s() - t0, igi, vw.level);
+	fprintf(rec, "%.3f,%d,%d", now_s() - t0, sweep_gain, vw.level);
 	for (i = 0; i < vw.nb; i++)
 		fprintf(rec, ",%d", (int)lrintf(sweep_db[i] * 10));
 	fputc('\n', rec);
@@ -1605,19 +2017,16 @@ static void set_view_zoom(double target, int level)
 {
 	char m[96];
 	if (level <= 0) {
-		double f = vw.f0 + (cursor + 0.5) * vw.bw;
+		double f = bin_mhz(cursor);
 		view_full();
-		cursor = (int)((f - vw.f0) / vw.bw);
-		if (cursor < 0) cursor = 0;
-		if (cursor >= vw.nb) cursor = vw.nb - 1;
+		cursor = mhz_bin(f);
 		snprintf(m, sizeof(m), "full band");
 	} else {
 		view_zoom(target, level);
-		cursor = (int)((target - vw.f0) / vw.bw);
-		if (cursor < 0) cursor = 0;
-		if (cursor >= vw.nb) cursor = vw.nb - 1;
-		snprintf(m, sizeof(m), "zoom %.0f MHz around %.2f MHz (ch %d)", vw.nb * vw.bw, target, vw.ch);
+		cursor = mhz_bin(target);
+		snprintf(m, sizeof(m), "zoom %.0f MHz around %.2f MHz (ch %d)", vw.nb * vw.bw, bin_mhz(cursor), vw.ch);
 	}
+	view_gen++;
 	reset_traces();
 	rec_view_line();
 	status(m);
@@ -1642,7 +2051,7 @@ static void find_peak(void)
 	if (best < 0)
 		return;
 	cursor = best;
-	snprintf(m, sizeof(m), "peak %.2f MHz, %.0f dB over background", vw.f0 + (best + 0.5) * vw.bw, bestv);
+	snprintf(m, sizeof(m), "peak %.2f MHz, %.0f dB over background", bin_mhz(best), bestv);
 	status(m);
 }
 
@@ -1651,7 +2060,7 @@ static int shot_req;
 static void on_button(int code)
 {
 #ifdef __linux__
-	double fcur = vw.f0 + (cursor + 0.5) * vw.bw;
+	double fcur = bin_mhz(cursor);
 	switch (code) {
 	case KEY_SPACE: /* A */
 		show_hold = !show_hold;
@@ -1737,36 +2146,14 @@ static void sel_layer(int code)
 static void poll_input(void)
 {
 #ifdef __linux__
-	struct input_event ev[16];
-	ssize_t n;
-	if (in_fd < 0)
-		return;
-	while ((n = read(in_fd, ev, sizeof(ev))) > 0) {
-		int k;
-		for (k = 0; k < (int)(n / sizeof(ev[0])); k++) {
-			int code = ev[k].code, val = ev[k].value;
-			if (ev[k].type != EV_KEY)
-				continue;
-			if (code == KEY_RIGHTCTRL) { /* SELECT: shift layer, or peak on a tap */
-				if (val == 1) {
-					sel_down = 1;
-					sel_combo = 0;
-				} else if (val == 0) {
-					sel_down = 0;
-					if (!sel_combo)
-						find_peak();
-				}
-				continue;
-			}
-			if (!val) /* ignore key releases for everything else */
-				continue;
-			if (sel_down) {
-				sel_layer(code);
-				sel_combo = 1;
-			} else {
-				on_button(code);
-			}
-		}
+	int code;
+	while ((code = next_key()) >= 0) {
+		if (code == KEY_RIGHTCTRL) /* SELECT tapped on its own */
+			find_peak();
+		else if (code & KEY_SHIFTED)
+			sel_layer(code & ~KEY_SHIFTED);
+		else
+			on_button(code);
 	}
 #endif
 }
@@ -1782,6 +2169,25 @@ static void on_signal(int sig)
  * a spectrum from decoded frames. It also works without opening the radio. */
 #define PACKET_X 24
 #define PACKET_W 592
+#define TL_TOP 68 /* traffic timeline panel: rows TL_TOP .. TL_TOP + TL_H - 1 */
+#define TL_H 78
+
+static int timeline_column(double t, double duration)
+{
+	int x = duration > 0 ? (int)(t / duration * PACKET_W) : 0;
+	return x < 0 ? 0 : x >= PACKET_W ? PACKET_W - 1 : x;
+}
+
+/* Shown before a load that can take seconds from the SD card. */
+static void loading_screen(const char *path)
+{
+	char s[128];
+	const char *name = strrchr(path, '/');
+	fill(0, 0, SW, SH, C_BG);
+	snprintf(s, sizeof(s), "Loading %.90s ...", name ? name + 1 : path);
+	text(24, SH / 2 - 8, C_TEXT, s);
+	present();
+}
 
 static size_t packet_at_time(const struct packet_capture *capture, double pos)
 {
@@ -1796,13 +2202,13 @@ static size_t packet_at_time(const struct packet_capture *capture, double pos)
 
 static void packet_signal(const struct packet_record *packet, char *out, size_t size)
 {
-	if (packet->signal == 32767) snprintf(out, size, "---");
+	if (packet->signal == PACKET_SIGNAL_UNKNOWN) snprintf(out, size, "---");
 	else snprintf(out, size, "%d%s", packet->signal, packet->signal == 0 ? "?" : "");
 }
 
 static void packet_rate(const struct packet_record *packet, char *out, size_t size)
 {
-	if (packet->mcs != 255) snprintf(out, size, "MCS %u", packet->mcs);
+	if (packet->mcs != PACKET_MCS_UNKNOWN) snprintf(out, size, "MCS %u", packet->mcs);
 	else if (packet->rate_half) snprintf(out, size, "%g%s Mb/s", packet->rate_half / 2.0,
 	                                  packet->rate_half == 93 ? "?" : "");
 	else snprintf(out, size, "---");
@@ -1834,24 +2240,30 @@ static void packet_render(const struct packet_capture *capture, const char *path
 	text(12, 26, C_DIM, s);
 	text(24, 48, C_TEXT, "TRAFFIC: packets / time bin");
 	text(376, 48, C_LIVE, "MGMT"); text(440, 48, C_AVG, "CTRL"); text(504, 48, C_HOLD, "DATA");
-	fill(PACKET_X, 68, PACKET_W, 78, C_PANEL);
-	for (x = 0; x < PACKET_W; x++) {
-		int y = 145;
+	fill(PACKET_X, TL_TOP, PACKET_W, TL_H, C_PANEL);
+	for (x = 0; x < PACKET_W; x++) { /* stacked: management, control, data */
+		int bottom = TL_TOP + TL_H - 1, filled = 0;
 		unsigned cumulative = 0;
 		for (category = 0; category < 3; category++) {
 			int height;
+			if (!bins[category][x])
+				continue;
 			cumulative += bins[category][x];
-			height = peak ? (int)(cumulative * 76.0 / peak) : 0;
-			if (height) line(PACKET_X + x, y, PACKET_X + x, 145 - height, colours[category]);
-			y = 145 - height;
+			height = (int)lround(cumulative * (TL_H - 1.0) / peak);
+			if (height <= filled) /* every category with frames shows at least a pixel */
+				height = filled + 1;
+			if (height > TL_H - 1)
+				height = TL_H - 1;
+			if (height > filled)
+				line(PACKET_X + x, bottom - filled, PACKET_X + x, bottom - height + 1, colours[category]);
+			filled = height;
 		}
 	}
-	x = capture->duration > 0 ? (int)(pos / capture->duration * (PACKET_W - 1)) : 0;
-	line(PACKET_X + x, 66, PACKET_X + x, 147, C_CURSOR);
-	snprintf(s, sizeof(s), "0 s       peak %u/bin; bin %.2f ms", peak,
-	         capture->duration * 1000 / PACKET_W);
-	text(24, 150, C_DIM, s);
-	snprintf(s, sizeof(s), "%.3f s", capture->duration); text(536, 150, C_DIM, s);
+	x = timeline_column(pos, capture->duration);
+	line(PACKET_X + x, TL_TOP - 2, PACKET_X + x, TL_TOP + TL_H + 1, C_CURSOR);
+	snprintf(s, sizeof(s), "0 s       peak %u/bin; bin %.2f ms", peak, capture->duration * 1000 / PACKET_W);
+	text(24, TL_TOP + TL_H + 4, C_DIM, s);
+	snprintf(s, sizeof(s), "%.3f s", capture->duration); text(536, TL_TOP + TL_H + 4, C_DIM, s);
 	snprintf(s, sizeof(s), "Frame %zu/%zu   %s   %u bytes", selected + 1, capture->count,
 	         packet_type_name(packet), packet->length);
 	text(24, 176, C_TEXT, s);
@@ -1864,7 +2276,7 @@ static void packet_render(const struct packet_capture *capture, const char *path
 	packet_address(packet->transmitter, packet->has_transmitter, tx, sizeof(tx));
 	packet_address(packet->receiver, packet->has_receiver, rx, sizeof(rx));
 	snprintf(s, sizeof(s), "TX %s   RX %s", tx, rx); text(24, 216, C_DIM, s);
-	if (packet->sequence != 65535) snprintf(sequence, sizeof(sequence), "%u", packet->sequence);
+	if (packet->sequence != PACKET_SEQUENCE_UNKNOWN) snprintf(sequence, sizeof(sequence), "%u", packet->sequence);
 	else snprintf(sequence, sizeof(sequence), "---");
 	snprintf(s, sizeof(s), "Seq %s   %s%s%s", sequence, packet->protected_frame ? "PROTECTED  " : "",
 	         packet->retry ? "RETRY  " : "", packet->bad_fcs ? "BAD FCS" : "");
@@ -1880,7 +2292,9 @@ static void packet_render(const struct packet_capture *capture, const char *path
 		         p->length, signal, rate_text);
 		text(24, y, r == selected ? C_LIVE : C_DIM, s);
 	}
-	if (capture->limited || capture->skipped) {
+	if (status_until > now_s()) {
+		text(24, 426, C_HOLD, status_msg);
+	} else if (capture->limited || capture->skipped) {
 		snprintf(s, sizeof(s), "%s%zu skipped; showing %zu frames", capture->limited ? "LIMIT: " : "",
 		         capture->skipped, capture->count);
 		text(24, 426, C_HOLD, s);
@@ -1891,290 +2305,591 @@ static void packet_render(const struct packet_capture *capture, const char *path
 
 static int packet_review(const char *path, const char *shot, double start)
 {
+	static unsigned bins[3][PACKET_W];
 	struct packet_capture capture;
 	char error[160];
-	unsigned bins[3][PACKET_W] = {{0}}, peak = 0;
+	unsigned peak = 0;
 	double pos, last, speed = 1;
-	size_t selected, i;
-	int playing = !shot, back = 0, result = 0;
+	size_t selected, i, drawn = (size_t)-1;
+	int playing = !shot, back = 0, result = 0, dirty = 1, drawn_x = -1, status_was = 0;
+	if (!shot)
+		loading_screen(path);
 	if (pcap_load(path, &capture, error, sizeof(error)) != 0) {
 		fprintf(stderr, "PCAP: %s\n", error); status(error); return 1;
 	}
+	memset(bins, 0, sizeof(bins));
 	pos = start < capture.duration ? start : capture.duration;
 	selected = packet_at_time(&capture, pos);
 	for (i = 0; i < capture.count; i++) {
 		const struct packet_record *p = &capture.packets[i];
-		int bin = capture.duration > 0 ? (int)(p->time / capture.duration * (PACKET_W - 1)) : 0;
+		int bin = timeline_column(p->time, capture.duration);
 		unsigned total;
 		int category = p->type < 3 ? p->type : 2;
 		bins[category][bin]++;
 		total = bins[0][bin] + bins[1][bin] + bins[2][bin];
 		if (total > peak) peak = total;
 	}
+	if (shot) {
+		packet_render(&capture, path, selected, pos, speed, playing, bins, peak);
+		result = write_image(shot) != 0;
+		goto done;
+	}
+	audio_quiet = 1; /* no level to follow here */
+	while (next_key() >= 0) /* presses made while it loaded */
+		;
 	last = now_s();
 	while (!quit && !back) {
 		double t = now_s();
+		int code, status_now = status_until > t;
 		if (playing) {
 			pos += (t - last) * speed;
-			if (pos >= capture.duration) { pos = capture.duration; playing = 0; }
+			if (pos >= capture.duration) { pos = capture.duration; playing = 0; dirty = 1; }
 			selected = packet_at_time(&capture, pos);
 		}
 		last = t;
-		packet_render(&capture, path, selected, pos, speed, playing, bins, peak);
-		if (shot) { result = write_image(shot) != 0; break; }
-		present();
-#ifdef __linux__
-		{
-			struct input_event ev[16];
-			ssize_t n;
-			while (in_fd >= 0 && (n = read(in_fd, ev, sizeof(ev))) > 0) {
-				int k;
-				for (k = 0; k < (int)(n / sizeof(ev[0])); k++) {
-					if (ev[k].type != EV_KEY || !ev[k].value) continue;
-					switch (ev[k].code) {
-					case KEY_SPACE:
-						if (!playing && selected + 1 == capture.count && pos >= capture.duration) {
-							pos = 0; selected = 0;
-						}
-						playing = !playing; break;
-					case KEY_LEFT:
-						playing = 0; if (selected) selected--;
-						pos = capture.packets[selected].time; break;
-					case KEY_RIGHT:
-						playing = 0; if (selected + 1 < capture.count) selected++;
-						pos = capture.packets[selected].time; break;
-					case KEY_UP: case KEY_DOWN:
-						pos += ev[k].code == KEY_UP ? 1 : -1;
-						if (pos < 0) pos = 0;
-						if (pos > capture.duration) pos = capture.duration;
-						selected = packet_at_time(&capture, pos); break;
-					case KEY_E: if (speed > 0.25) speed /= 2; break;
-					case KEY_T: if (speed < 8) speed *= 2; break;
-					case KEY_ENTER: save_screenshot(); break;
-					case KEY_LEFTCTRL: back = 1; break;
-					case KEY_ESC: quit = 1; break;
-					}
+		if (selected != drawn || timeline_column(pos, capture.duration) != drawn_x || status_now != status_was)
+			dirty = 1;
+		status_was = status_now;
+		if (dirty) { /* redraw only on change, so a paused replay leaves the CPU alone */
+			packet_render(&capture, path, selected, pos, speed, playing, bins, peak);
+			present();
+			drawn = selected;
+			drawn_x = timeline_column(pos, capture.duration);
+			dirty = 0;
+		}
+		while (!back && !quit && (code = next_key()) >= 0) {
+			dirty = 1;
+			switch (code & ~KEY_SHIFTED) {
+			case KEY_SPACE:
+				if (!playing && selected + 1 == capture.count && pos >= capture.duration) {
+					pos = 0; selected = 0;
 				}
+				playing = !playing; break;
+			case KEY_LEFT:
+				playing = 0; if (selected) selected--;
+				pos = capture.packets[selected].time; break;
+			case KEY_RIGHT:
+				playing = 0; if (selected + 1 < capture.count) selected++;
+				pos = capture.packets[selected].time; break;
+			case KEY_UP: case KEY_DOWN:
+				pos += (code & ~KEY_SHIFTED) == KEY_UP ? 1 : -1;
+				if (pos < 0) pos = 0;
+				if (pos > capture.duration) pos = capture.duration;
+				selected = packet_at_time(&capture, pos); break;
+			case KEY_E: if (speed > 0.25) speed /= 2; break;
+			case KEY_T: if (speed < 8) speed *= 2; break;
+			case KEY_ENTER: save_screenshot(); break;
+			case KEY_LEFTCTRL: back = 1; break;
+			case KEY_ESC: quit = 1; break;
 			}
 		}
-#endif
-		usleep(15000);
+		if (!dirty && !back && !quit)
+			wait_input(playing ? 1.0 / 30 : status_now ? status_until - now_s() + 0.01 : 0.5);
 	}
+	audio_quiet = 0;
+done:
 	fprintf(stderr, "replay: %zu frames, %.6f seconds, %zu skipped%s\n", capture.count,
 	        capture.duration, capture.skipped, capture.limited ? " (record limit reached)" : "");
 	pcap_free(&capture);
 	return result;
 }
 
-/* Replay a saved recording (a CSV under rec/) as spectrum + waterfall, reusing
- * the live render(). Handles both the sweep recordings (X) and burst captures. */
+/* Spectrum CSV playback, for sweep recordings (X) and burst captures. A sweep
+ * recording starts a "# view" section each time the view changed while it was
+ * recording, and every row is shown on its own section's frequency axis. */
+#ifndef REVIEW_MAX_VALUES
+#define REVIEW_MAX_VALUES (4u << 20) /* readings kept: 8 MB, about an hour of full band */
+#endif
+#define REVIEW_MAX_SECTIONS 256
 
-static char review_name[128];
+struct rec_section {
+	int level, nb, ch;
+	double f0, bw;
+	size_t first, rows;           /* rows first .. first + rows - 1 */
+	float mn[MAXBINS], mx[MAXBINS];
+};
 
-static void review_play(const char *path)
+struct recording {
+	struct rec_section *sections;
+	size_t nsections;
+	double *ts;                   /* per row: seconds from the first row, never decreasing */
+	uint32_t *start;              /* per row: index of its first reading */
+	uint16_t *section;            /* per row */
+	int16_t *values;              /* dB*10 readings */
+	size_t rows, row_cap, nvalues, value_cap;
+	int truncated;
+	double duration;
+};
+
+static void recording_free(struct recording *r)
 {
-	FILE *f;
-	char line[8192], *p, *q;
-	double f0 = 2402.0, bw = 0.3125, pos = 0, speed = 1.0, last, rowdt;
-	int nb = 0, leading = 2, lvl = 0, nrows = 0, cap = 0, i, playing = 1, back = 0;
-	int save_mode = disp_mode, save_cursor = cursor;
-	struct view save_vw = vw; /* the recording's view replaces the live one meanwhile */
-	float *data = NULL, mn[MAXBINS], mx[MAXBINS];
-	double *ts = NULL;
+	free(r->sections);
+	free(r->ts);
+	free(r->start);
+	free(r->section);
+	free(r->values);
+	memset(r, 0, sizeof(*r));
+}
 
-	if (in_fd < 0)
-		return;
-	f = fopen(path, "r");
-	if (!f) {
-		status("could not open recording");
-		return;
+static int recording_grow(struct recording *r, int nb)
+{
+	if (r->rows == r->row_cap) {
+		size_t cap = r->row_cap ? r->row_cap * 2 : 1024;
+		double *ts = realloc(r->ts, cap * sizeof(*ts));
+		uint32_t *start = ts ? realloc(r->start, cap * sizeof(*start)) : NULL;
+		uint16_t *section = start ? realloc(r->section, cap * sizeof(*section)) : NULL;
+		if (ts) r->ts = ts;
+		if (start) r->start = start;
+		if (!section) return -1;
+		r->section = section;
+		r->row_cap = cap;
+	}
+	if (r->nvalues + (size_t)nb > r->value_cap) {
+		size_t cap = r->value_cap ? r->value_cap * 2 : 65536;
+		int16_t *values;
+		while (cap < r->nvalues + (size_t)nb) cap *= 2;
+		if (cap > REVIEW_MAX_VALUES) cap = REVIEW_MAX_VALUES;
+		values = realloc(r->values, cap * sizeof(*values));
+		if (!values) return -1;
+		r->values = values;
+		r->value_cap = cap;
+	}
+	return 0;
+}
+
+static int bad_section(const struct rec_section *s)
+{
+	return s->level < 0 || s->level > 3 || s->nb < 0 || s->nb > MAXBINS || s->ch < 0 || s->ch > 14 ||
+	       !(s->f0 >= 2300 && s->f0 <= 2600) || !(s->bw > 0.001 && s->bw <= 1);
+}
+
+/* Returns 0, or -1 with a message. Rows that do not fit their section (a wrong
+ * number of readings, or no time) are skipped; past REVIEW_MAX_VALUES readings
+ * the rest of the file is left out and truncated is set. */
+static int recording_load(const char *path, struct recording *r, char *error, size_t error_size)
+{
+	static char line[8192];
+	struct rec_section cur;
+	FILE *f;
+	int leading = 2, pending = 1, i;
+	size_t k;
+	double last = 0;
+
+	memset(r, 0, sizeof(*r));
+	memset(&cur, 0, sizeof(cur));
+	cur.f0 = 2402.0;
+	cur.bw = 0.3125;
+	if ((f = fopen(path, "r")) == NULL) {
+		snprintf(error, error_size, "Cannot open recording: %s", strerror(errno));
+		return -1;
 	}
 	while (fgets(line, sizeof(line), f)) {
+		char *p, *end;
+		int nb = 0;
+		double t;
 		if (line[0] == '#') {
-			if ((p = strstr(line, "level=")) != NULL) { leading = 3; sscanf(p, "level=%d", &lvl); }
-			if ((p = strstr(line, "f0=")) != NULL) sscanf(p, "f0=%lf", &f0);
-			if ((p = strstr(line, "bw=")) != NULL) sscanf(p, "bw=%lf", &bw);
-			if ((p = strstr(line, "bin i =")) != NULL) { leading = 2; sscanf(p, "bin i = %lf", &f0); bw = 0.3125; }
+			if ((p = strstr(line, "# view ")) != NULL) { /* sweep recording: a new section */
+				leading = 3;
+				pending = 1;
+				memset(&cur, 0, sizeof(cur));
+				if ((p = strstr(line, "level=")) != NULL) cur.level = atoi(p + 6);
+				if ((p = strstr(line, "bins=")) != NULL) cur.nb = atoi(p + 5);
+				if ((p = strstr(line, "f0=")) != NULL) cur.f0 = strtod(p + 3, NULL);
+				if ((p = strstr(line, "bw=")) != NULL) cur.bw = strtod(p + 3, NULL);
+				if ((p = strstr(line, "ch=")) != NULL) cur.ch = atoi(p + 3);
+			} else if ((p = strstr(line, "bin i =")) != NULL) { /* burst capture */
+				leading = 2;
+				pending = 1;
+				memset(&cur, 0, sizeof(cur));
+				cur.f0 = strtod(p + 7, NULL);
+				cur.bw = 0.3125;
+				if ((p = strstr(line, "channel ")) != NULL) cur.ch = atoi(p + 8);
+			}
+			if (bad_section(&cur)) {
+				snprintf(error, error_size, "Unrecognised recording header");
+				goto fail;
+			}
 			continue;
 		}
-		if (nb == 0) {
-			int c = 0;
-			for (q = line; *q; q++)
-				if (*q == ',')
-					c++;
-			nb = c + 1 - leading;
-			if (nb < 1 || nb > MAXBINS) { fclose(f); status("unrecognised recording"); return; }
-			cap = 400000 / nb;
-			data = malloc((size_t)cap * nb * sizeof(float));
-			ts = malloc((size_t)cap * sizeof(double));
-			if (!data || !ts) { free(data); free(ts); fclose(f); status("out of memory"); return; }
-			for (i = 0; i < nb; i++) { mn[i] = 1e9f; mx[i] = -1e9f; }
+		for (p = line; *p; p++)
+			nb += *p == ',';
+		nb += 1 - leading;
+		t = strtod(line, &end);
+		if (end == line || !isfinite(t) || nb < 1 || nb > MAXBINS || (cur.nb && nb != cur.nb))
+			continue; /* torn or foreign row */
+		if (r->nvalues + (size_t)nb > REVIEW_MAX_VALUES) {
+			r->truncated = 1;
+			break;
 		}
-		if (nrows < cap) {
-			float *row = data + (size_t)nrows * nb;
-			int col;
-			ts[nrows] = atof(line);
-			q = line;
-			for (col = 0; col < leading && q; col++) { q = strchr(q, ','); if (q) q++; }
-			for (i = 0; i < nb && q; i++) {
-				row[i] = (float)(atoi(q) / 10.0);
-				if (row[i] < mn[i]) mn[i] = row[i];
-				if (row[i] > mx[i]) mx[i] = row[i];
-				q = strchr(q, ','); if (q) q++;
+		if (pending) {
+			struct rec_section *grown;
+			if (r->nsections == REVIEW_MAX_SECTIONS) {
+				r->truncated = 1;
+				break;
 			}
-			for (; i < nb; i++) row[i] = 0;
-			nrows++;
+			grown = realloc(r->sections, (r->nsections + 1) * sizeof(*grown));
+			if (!grown) {
+				snprintf(error, error_size, "Out of memory loading recording");
+				goto fail;
+			}
+			r->sections = grown;
+			cur.nb = nb;
+			cur.first = r->rows;
+			cur.rows = 0;
+			r->sections[r->nsections++] = cur;
+			pending = 0;
 		}
+		if (recording_grow(r, nb)) {
+			snprintf(error, error_size, "Out of memory loading recording");
+			goto fail;
+		}
+		if (!r->rows)
+			last = t;
+		r->ts[r->rows] = t < last ? last : t; /* a torn last line cannot run time backwards */
+		last = r->ts[r->rows];
+		r->start[r->rows] = (uint32_t)r->nvalues;
+		r->section[r->rows] = (uint16_t)(r->nsections - 1);
+		p = line;
+		for (i = 0; i < leading && p; i++)
+			if ((p = strchr(p, ',')) != NULL) p++;
+		for (i = 0; i < nb; i++) {
+			long v = p ? strtol(p, NULL, 10) : 0;
+			r->values[r->nvalues++] = (int16_t)(v < -32768 ? -32768 : v > 32767 ? 32767 : v);
+			if (p && (p = strchr(p, ',')) != NULL) p++;
+		}
+		r->sections[r->nsections - 1].rows++;
+		r->rows++;
 	}
 	fclose(f);
-	if (nrows < 2) { free(data); free(ts); status("recording too short"); return; }
+	f = NULL;
+	if (r->rows == 0) {
+		snprintf(error, error_size, "No readings in recording");
+		goto fail;
+	}
+	for (k = 1; k < r->rows; k++)
+		r->ts[k] -= r->ts[0];
+	r->ts[0] = 0;
+	r->duration = r->ts[r->rows - 1];
+	for (k = 0; k < r->nsections; k++) { /* each section's background (min) and max hold */
+		struct rec_section *s = &r->sections[k];
+		size_t row;
+		for (i = 0; i < s->nb; i++) {
+			s->mn[i] = 1e9f;
+			s->mx[i] = -1e9f;
+		}
+		for (row = s->first; row < s->first + s->rows; row++)
+			for (i = 0; i < s->nb; i++) {
+				float db = r->values[r->start[row] + i] / 10.0f;
+				if (db < s->mn[i]) s->mn[i] = db;
+				if (db > s->mx[i]) s->mx[i] = db;
+			}
+	}
+	return 0;
+fail:
+	if (f)
+		fclose(f);
+	recording_free(r);
+	return -1;
+}
 
+static size_t recording_row(const struct recording *r, double pos)
+{
+	size_t lo = 0, hi = r->rows;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (r->ts[mid] <= pos) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo ? lo - 1 : 0;
+}
+
+/* Put row `row` on screen: its section's view and traces, and a waterfall of
+ * that row and the ones recorded before it, newest on top. */
+static void recording_show(const struct recording *r, size_t row)
+{
+	const struct rec_section *s = &r->sections[r->section[row]];
+	size_t y, rows = row - s->first + 1;
+	int i;
 	memset(&vw, 0, sizeof(vw));
-	vw.level = lvl; vw.nb = nb; vw.f0 = f0; vw.bw = bw; vw.dc_lo = 1; vw.dc_hi = 0;
-	for (i = 0; i < nb; i++) { base_db[i] = mn[i]; hold_db[i] = mx[i]; avg_db[i] = mn[i]; }
+	vw.level = s->level;
+	vw.nb = s->nb;
+	vw.f0 = s->f0;
+	vw.bw = s->bw;
+	vw.ch = s->ch;
+	vw.dc_lo = 1;
+	vw.dc_hi = 0;
+	if (cursor >= vw.nb)
+		cursor = vw.nb - 1;
+	for (i = 0; i < vw.nb; i++) {
+		sweep_db[i] = r->values[r->start[row] + i] / 10.0f;
+		base_db[i] = avg_db[i] = s->mn[i];
+		hold_db[i] = s->mx[i];
+	}
 	have_hold = have_base = have_avg = 1;
-	disp_mode = 0;
-	wf_rows = 0;
-	rowdt = (ts[nrows - 1] - ts[0]) / nrows + 1e-6;
-	snprintf(review_name, sizeof(review_name), "%s", strrchr(path, '/') ? strrchr(path, '/') + 1 : path);
-	last = now_s();
-	in_review = 1;
+	if (rows > WHGT)
+		rows = WHGT;
+	for (y = 0; y < rows; y++) {
+		const int16_t *v = r->values + r->start[row - y];
+		for (i = 0; i < vw.nb; i++)
+			wf[y][i] = wf_level(v[i] / 10.0f, i);
+	}
+	wf_head = 0;
+	wf_rows = (int)rows;
+}
 
+static void review_draw(const struct recording *r, size_t row, double speed, int playing, const char *name)
+{
+	char s[256];
+	double t = r->ts[row];
+	render();
+	fill(0, 0, SW, 18, C_BG);
+	snprintf(s, sizeof(s), "REVIEW  %.36s   %.1f / %.1f s   x%g   %s%s", name, t, r->duration, speed,
+	         playing ? "PLAY" : row + 1 >= r->rows ? "END" : "PAUSE", r->truncated ? "  CUT SHORT" : "");
+	text(4, 2, C_TEXT, s);
+	fill(0, WY0 + WHGT, SW, SH - WY0 - WHGT, C_BG);
+	if (status_until > now_s())
+		text(4, WY0 + WHGT, C_HOLD, status_msg);
+	else
+		text(4, WY0 + WHGT, C_DIM, "A play  L/R step  L1/R1 speed  Up/Dn range  Y enhance  START png  B back");
+	fill(PX0, SH - 3, PW, 2, C_GRID);
+	fill(PX0 + (r->duration > 0 ? (int)(t / r->duration * (PW - 3)) : 0), SH - 4, 3, 4, C_CURSOR);
+}
+
+static int review_play(const char *path, const char *shot, double start)
+{
+	struct recording r;
+	struct view save_vw = vw;
+	const char *name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+	char error[160];
+	int save_cursor = cursor, save_mode = disp_mode, save_enhance = enhance, save_scaled = scaled;
+	float save_low = db_low, save_enh_low = enh_low;
+	double pos, last, speed = 1;
+	size_t row, drawn = (size_t)-1;
+	int playing = !shot, back = 0, result = 0, dirty = 1, status_was = 0;
+
+	if (!shot)
+		loading_screen(path);
+	if (recording_load(path, &r, error, sizeof(error)) != 0) {
+		fprintf(stderr, "recording: %s\n", error);
+		status(error);
+		return 1;
+	}
+	in_review = 1;
+	disp_mode = 0;
+	recording_show(&r, 0);
+	autoscale(); /* levels from the first row; Up/Down shift them */
+	pos = start < r.duration ? start : r.duration;
+	row = recording_row(&r, pos);
+	if (shot) {
+		recording_show(&r, row);
+		review_draw(&r, row, speed, playing, name);
+		result = write_image(shot) != 0;
+		goto done;
+	}
+	while (next_key() >= 0) /* presses made while it loaded */
+		;
+	last = now_s();
 	while (!quit && !back) {
 		double t = now_s();
-		int r;
-		float *row;
-		char s[256];
-		if (playing)
-			pos += (t - last) * speed / rowdt;
+		int code, status_now = status_until > t;
+		if (playing) {
+			pos += (t - last) * speed;
+			if (pos >= r.duration) { pos = r.duration; playing = 0; dirty = 1; }
+			row = recording_row(&r, pos);
+		}
 		last = t;
-		if (pos >= nrows) pos = 0;
-		if (pos < 0) pos = nrows - 1;
-		r = (int)pos;
-		row = data + (size_t)r * nb;
-		for (i = 0; i < nb; i++)
-			sweep_db[i] = row[i];
-		push_waterfall();
-		render();
-		fill(0, 0, SW, 18, C_BG);
-		snprintf(s, sizeof(s), "REVIEW  %s   %.1f / %.1f s   x%.2g   %s", review_name, ts[r] - ts[0],
-		         ts[nrows - 1] - ts[0], speed, playing ? "PLAY" : "PAUSE");
-		text(4, 2, C_TEXT, s);
-		fill(PX0, SH - 6, PW, 2, C_GRID);
-		fill(PX0 + (int)(pos / (nrows - 1) * (PW - 1)), SH - 9, 3, 7, C_CURSOR);
-		fill(0, SH - 20, SW, 12, C_BG);
-		text(4, SH - 19, C_DIM, "A play/pause  Left/Right step  L1/R1 speed  Y enhance  B back  MENU quit");
-		present();
-#ifdef __linux__
-		{
-			struct input_event ev[16];
-			ssize_t n;
-			while (in_fd >= 0 && (n = read(in_fd, ev, sizeof(ev))) > 0) {
-				int k;
-				for (k = 0; k < (int)(n / sizeof(ev[0])); k++) {
-					if (ev[k].type != EV_KEY || !ev[k].value)
-						continue;
-					switch (ev[k].code) {
-					case KEY_SPACE: playing = !playing; break;       /* A */
-					case KEY_LEFT: playing = 0; pos -= 1; break;
-					case KEY_RIGHT: playing = 0; pos += 1; break;
-					case KEY_E: if (speed > 0.25) speed /= 2; break; /* L1 */
-					case KEY_T: if (speed < 8) speed *= 2; break;    /* R1 */
-					case KEY_LEFTALT: enhance = !enhance; break;     /* Y */
-					case KEY_LEFTCTRL: back = 1; break;              /* B */
-					case KEY_ESC: quit = 1; break;                   /* MENU */
-					}
-				}
+		if (row != drawn || status_now != status_was)
+			dirty = 1;
+		status_was = status_now;
+		if (dirty) {
+			recording_show(&r, row);
+			if (audio_on) { /* the tone follows the recording at the cursor */
+				float nn = (shown(sweep_db, cursor) - low()) / DB_SPAN;
+				audio_norm = nn < 0 ? 0 : nn > 1 ? 1 : nn;
+			}
+			review_draw(&r, row, speed, playing, name);
+			present();
+			drawn = row;
+			dirty = 0;
+		}
+		while (!back && !quit && (code = next_key()) >= 0) {
+			dirty = 1;
+			switch (code & ~KEY_SHIFTED) {
+			case KEY_SPACE:
+				if (!playing && row + 1 >= r.rows) { pos = 0; row = 0; }
+				playing = !playing; break;
+			case KEY_LEFT: playing = 0; if (row) row--; pos = r.ts[row]; break;
+			case KEY_RIGHT: playing = 0; if (row + 1 < r.rows) row++; pos = r.ts[row]; break;
+			case KEY_UP: if (enhance) enh_low += 3; else db_low += 3; break;
+			case KEY_DOWN: if (enhance) enh_low -= 3; else db_low -= 3; break;
+			case KEY_E: if (speed > 0.25) speed /= 2; break;
+			case KEY_T: if (speed < 8) speed *= 2; break;
+			case KEY_LEFTALT: enhance = !enhance; break;
+			case KEY_ENTER: save_screenshot(); break;
+			case KEY_LEFTCTRL: back = 1; break;
+			case KEY_ESC: quit = 1; break;
 			}
 		}
-#endif
-		usleep(15000);
+		if (!dirty && !back && !quit)
+			wait_input(playing ? 1.0 / 30 : status_now ? status_until - now_s() + 0.01 : 0.5);
 	}
+done:
 	in_review = 0;
-	disp_mode = save_mode;
+	vw = save_vw; /* back to the live view and its settings */
 	cursor = save_cursor;
-	vw = save_vw; /* back to the live view (a zoomed recording left channel 0 behind) */
-	free(data);
-	free(ts);
+	disp_mode = save_mode;
+	enhance = save_enhance;
+	scaled = save_scaled;
+	db_low = save_low;
+	enh_low = save_enh_low;
+	recording_free(&r);
 	reset_traces();
+	return result;
 }
+
+/* The recording browser: spectrum CSVs and packet captures from rec/ and
+ * research/, newest first. */
+struct rec_entry {
+	char path[300];
+	time_t mtime;
+	int packet;
+};
+
+static int has_suffix(const char *s, const char *suffix)
+{
+	size_t l = strlen(s), n = strlen(suffix);
+	return l > n && !strcasecmp(s + l - n, suffix);
+}
+
+static int newest_first(const void *a, const void *b)
+{
+	const struct rec_entry *x = a, *y = b;
+	if (x->mtime != y->mtime)
+		return x->mtime < y->mtime ? 1 : -1;
+	return strcmp(y->path, x->path);
+}
+
+static size_t list_recordings(struct rec_entry **out)
+{
+	static const char *dirs[] = { "rec", "research" };
+	struct rec_entry *list = NULL;
+	size_t n = 0, cap = 0;
+	unsigned d;
+	for (d = 0; d < sizeof(dirs) / sizeof(dirs[0]); d++) {
+		DIR *dir = opendir(dirs[d]);
+		struct dirent *e;
+		if (dir == NULL)
+			continue;
+		while ((e = readdir(dir)) != NULL) {
+			struct stat st;
+			struct rec_entry *it;
+			int packet = has_suffix(e->d_name, ".pcap");
+			if (!packet && !has_suffix(e->d_name, ".csv"))
+				continue;
+			if (n == cap) {
+				struct rec_entry *grown = realloc(list, (cap ? cap * 2 : 64) * sizeof(*list));
+				if (grown == NULL)
+					break;
+				list = grown;
+				cap = cap ? cap * 2 : 64;
+			}
+			it = &list[n++];
+			snprintf(it->path, sizeof(it->path), "%s/%s", dirs[d], e->d_name);
+			it->packet = packet;
+			it->mtime = stat(it->path, &st) == 0 ? st.st_mtime : 0;
+		}
+		closedir(dir);
+	}
+	if (n)
+		qsort(list, n, sizeof(*list), newest_first);
+	*out = list;
+	return n;
+}
+
+#define BROWSE_ROWS 22
 
 static void review_session(void)
 {
-	char names[128][320], path[320];
-	static const char *directories[] = { "rec", "research" };
-	int count = 0, sel = 0, i, j, folder;
-	if (in_fd < 0) return;
-	sel_down = sel_combo = 0;
-	for (folder = 0; folder < 2; folder++) {
-		DIR *d = opendir(directories[folder]);
-		struct dirent *e;
-		if (!d) continue;
-		while ((e = readdir(d)) != NULL && count < 128) {
-			size_t l = strlen(e->d_name);
-			if ((l > 4 && !strcmp(e->d_name + l - 4, ".csv")) ||
-			    (l > 5 && !strcmp(e->d_name + l - 5, ".pcap"))) {
-				snprintf(names[count++], sizeof(names[0]), "%s/%s", directories[folder], e->d_name);
-			}
-		}
-		closedir(d);
-	}
-	for (i = 0; i < count; i++)
-		for (j = i + 1; j < count; j++)
-			if (strcmp(strrchr(names[j], '/') + 1, strrchr(names[i], '/') + 1) > 0) {
-				char tmp[320];
-				memcpy(tmp, names[i], sizeof(tmp));
-				memcpy(names[i], names[j], sizeof(tmp));
-				memcpy(names[j], tmp, sizeof(tmp));
-			}
+	struct rec_entry *list = NULL;
+	size_t count, sel = 0, i;
+	int dirty = 1, status_was = 0;
+	if (in_fd < 0)
+		return;
+	count = list_recordings(&list);
 	while (!quit) {
-		int chosen = -1, cancel = 0, first = sel / 22 * 22;
-		fill(0, 0, SW, SH, C_BG);
-		text(4, 6, C_TEXT, "REVIEW: spectrum recordings and packet captures");
-		if (count == 0) {
-			text(24, 48, C_DIM, "Save spectrum recordings or copy PCAPs to rec/ or research/.");
-			text(24, 72, C_DIM, "The capture tool's stock-monitor.pcap appears here automatically.");
+		int code, chosen = -1, cancel = 0, status_now = status_until > now_s();
+		audio_quiet = 1;
+		if (status_now != status_was)
+			dirty = 1;
+		status_was = status_now;
+		if (dirty) {
+			size_t first = sel / BROWSE_ROWS * BROWSE_ROWS;
+			char label[96];
+			fill(0, 0, SW, SH, C_BG);
+			snprintf(label, sizeof(label), "REVIEW: recordings and captures (%zu)   MiYooSDR %s", count,
+			         MIYOOSDR_VERSION);
+			text(4, 6, C_TEXT, label);
+			if (count == 0) {
+				text(24, 48, C_DIM, "Save spectrum recordings or copy PCAPs to rec/ or research/.");
+				text(24, 72, C_DIM, "The capture tool's stock-monitor.pcap appears here automatically.");
+			}
+			for (i = first; i < count && i < first + BROWSE_ROWS; i++) {
+				int y = 30 + (int)(i - first) * 18;
+				if (i == sel)
+					text(8, y, C_LIVE, ">");
+				snprintf(label, sizeof(label), "[%s] %.68s", list[i].packet ? "PCAP" : "CSV ", list[i].path);
+				text(24, y, i == sel ? C_LIVE : C_DIM, label);
+			}
+			if (status_now)
+				text(4, 438, C_HOLD, status_msg);
+			text(4, SH - 20, C_DIM, "Up/Down choose  Left/Right page  A open  B back  MENU quit");
+			present();
+			dirty = 0;
 		}
-		for (i = first; i < count && i < first + 22; i++) {
-			char label[80];
-			int y = 30 + (i - first) * 18;
-			size_t l = strlen(names[i]);
-			int is_packet = l > 5 && !strcmp(names[i] + l - 5, ".pcap");
-			if (i == sel) text(8, y, C_LIVE, ">");
-			snprintf(label, sizeof(label), "[%s] %.68s", is_packet ? "PCAP" : "CSV ", names[i]);
-			text(24, y, i == sel ? C_LIVE : C_DIM, label);
-		}
-		if (status_until > now_s()) text(4, 438, C_HOLD, status_msg);
-		text(4, SH - 20, C_DIM, "Up/Down choose    A open    B back");
-		present();
-#ifdef __linux__
-		{
-			struct input_event ev[16];
-			ssize_t n;
-			while (in_fd >= 0 && (n = read(in_fd, ev, sizeof(ev))) > 0) {
-				int k;
-				for (k = 0; k < (int)(n / sizeof(ev[0])); k++) {
-					if (ev[k].type != EV_KEY || !ev[k].value) continue;
-					switch (ev[k].code) {
-					case KEY_UP: if (sel > 0) sel--; break;
-					case KEY_DOWN: if (sel < count - 1) sel++; break;
-					case KEY_SPACE: if (count) chosen = sel; break;
-					case KEY_LEFTCTRL: cancel = 1; break;
-					case KEY_ESC: quit = 1; break;
-					}
-				}
+		while (chosen < 0 && !cancel && !quit && (code = next_key()) >= 0) {
+			dirty = 1;
+			switch (code & ~KEY_SHIFTED) {
+			case KEY_UP: if (sel > 0) sel--; break;
+			case KEY_DOWN: if (sel + 1 < count) sel++; break;
+			case KEY_LEFT: sel = sel > BROWSE_ROWS ? sel - BROWSE_ROWS : 0; break;
+			case KEY_RIGHT: if (count) sel = sel + BROWSE_ROWS < count ? sel + BROWSE_ROWS : count - 1; break;
+			case KEY_SPACE: if (count) chosen = (int)sel; break;
+			case KEY_LEFTCTRL: cancel = 1; break;
+			case KEY_ESC: quit = 1; break;
 			}
 		}
-#endif
 		if (chosen >= 0) {
-			size_t l;
-			snprintf(path, sizeof(path), "%s", names[chosen]);
-			l = strlen(path);
-			if (l > 5 && !strcmp(path + l - 5, ".pcap")) packet_review(path, NULL, 0);
-			else review_play(path);
-		} else if (cancel) return;
-		usleep(15000);
+			if (list[chosen].packet)
+				packet_review(list[chosen].path, NULL, 0);
+			else
+				review_play(list[chosen].path, NULL, 0);
+			dirty = 1;
+			continue;
+		}
+		if (cancel)
+			break;
+		if (!dirty && !quit)
+			wait_input(status_now ? status_until - now_s() + 0.01 : 0.5);
 	}
+	audio_quiet = 0;
+	free(list);
+}
+
+/* Playback and browsing need no radio: --replay FILE (.pcap or .csv) and --review.
+ * B in a replay opened with --replay goes to the browser, as it does elsewhere. */
+static int run_offline(const char *replay_path, const char *shot, double replay_at)
+{
+	int result;
+	make_lut();
+	view_full();
+	if (replay_path) {
+		result = has_suffix(replay_path, ".csv") ? review_play(replay_path, shot, replay_at)
+		                                         : packet_review(replay_path, shot, replay_at);
+		if (shot || quit || result)
+			return result;
+	}
+	review_session();
+	return 0;
 }
 
 /* -------------------------------------------------------------------- main */
@@ -2188,62 +2903,119 @@ static void print_row(const char *tag, const float *v)
 	printf("\n");
 }
 
+static void usage(FILE *out)
+{
+	fprintf(out,
+	        "usage: miyoosdr [options]   (none: live spectrum on the Miyoo's screen)\n"
+	        "  --replay FILE         play a packet capture (.pcap) or spectrum recording (.csv)\n"
+	        "  --replay-at SECONDS   start the replay that far in\n"
+	        "  --review              browse recordings and captures\n"
+	        "  --shot FILE           render one frame to FILE (.png or .ppm) and exit\n"
+	        "  --shot-after N        live sweeps before --shot renders (default 12)\n"
+	        "  --zoom MHZ LEVEL      start zoomed: level 1, 2, 3 = 20, 10, 5 MHz\n"
+	        "  --style N  --pal N    spectrum style 0-2, palette 0-%d\n"
+	        "  --occ                 start on the channel occupancy panel\n"
+	        "  --dump N              N sweeps as text\n"
+	        "  --burst MHZ SECONDS   single-channel power-vs-time recording\n"
+	        "  --probe  --racap      PSD timing and raw-capture probes\n"
+	        "  --fake                synthetic radio, for PC builds\n"
+	        "  --settings            use settings.txt even when started with options\n"
+	        "  --raw-tune            tune by RF register writes (this once hung the chip)\n"
+	        "  --needs-radio         exit 0 if the other options use the radio, 1 if not\n"
+	        "  --version  --help\n",
+	        NPAL - 1);
+}
+
+/* option values: whole or decimal numbers inside [lo, hi] */
+static int arg_int(const char *s, long lo, long hi, int *out)
+{
+	char *end;
+	long v;
+	errno = 0;
+	v = strtol(s, &end, 10);
+	if (end == s || *end || errno || v < lo || v > hi)
+		return -1;
+	*out = (int)v;
+	return 0;
+}
+
+static int arg_num(const char *s, double lo, double hi, double *out)
+{
+	char *end;
+	double v = strtod(s, &end);
+	if (end == s || *end || !isfinite(v) || v < lo || v > hi)
+		return -1;
+	*out = v;
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	const char *shot = NULL, *replay_path = NULL;
-	int review_only = 0, replay_at_set = 0, pm_only = 0;
+	const char *shot = NULL, *replay_path = NULL, *bad = NULL;
+	int review_only = 0, replay_at_set = 0, pm_only = 0, needs_radio = 0, version = 0, shot_failed = 0;
 	double replay_at = 0;
 	int dump = 0, probe = 0, racap = 0, burst_sec = 0, i, shot_after = 12, zlevel = 0, use_settings = argc == 1;
 	double t0, last_rate_t, last_flush, last_diag = 0, zf = 0, burst_mhz = 0;
 	long last_sweeps = 0;
 	struct sigaction sa;
 
-	for (i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--fake"))
-			fake = 1;
-		else if (!strcmp(argv[i], "--dump") && i + 1 < argc)
-			dump = atoi(argv[++i]);
-		else if (!strcmp(argv[i], "--shot") && i + 1 < argc)
-			shot = argv[++i];
-		else if (!strcmp(argv[i], "--replay")) {
-			if (++i >= argc) { fprintf(stderr, "--replay requires a PCAP path\n"); return 2; }
-			replay_path = argv[i];
-		} else if (!strcmp(argv[i], "--review")) {
-			review_only = 1;
-		} else if (!strcmp(argv[i], "--replay-at")) {
-			char *end;
-			if (++i >= argc) { fprintf(stderr, "--replay-at requires seconds\n"); return 2; }
-			replay_at = strtod(argv[i], &end);
-			if (end == argv[i] || *end || !isfinite(replay_at) || replay_at < 0) {
-				fprintf(stderr, "--replay-at requires nonnegative finite seconds\n"); return 2;
+	for (i = 1; i < argc && !bad; i++) {
+		const char *a = argv[i];
+		int left = argc - 1 - i; /* values after this option */
+		if (!strcmp(a, "--fake")) fake = 1;
+		else if (!strcmp(a, "--review")) review_only = 1;
+		else if (!strcmp(a, "--probe")) probe = 1;
+		else if (!strcmp(a, "--raw-tune")) raw_tune = 1;
+		else if (!strcmp(a, "--racap")) racap = 1;
+		else if (!strcmp(a, "--occ")) disp_mode = 1;
+		else if (!strcmp(a, "--settings")) use_settings = 1; /* tests: settings.txt with options too */
+		else if (!strcmp(a, "--pm-active")) pm_only = 1;
+		else if (!strcmp(a, "--needs-radio")) needs_radio = 1;
+		else if (!strcmp(a, "--version")) version = 1;
+		else if (!strcmp(a, "--help")) { usage(stdout); return 0; }
+		else if (!strcmp(a, "--shot")) { if (left < 1 || !*argv[i + 1]) bad = a; else shot = argv[++i]; }
+		else if (!strcmp(a, "--replay")) { if (left < 1 || !*argv[i + 1]) bad = a; else replay_path = argv[++i]; }
+		else if (!strcmp(a, "--replay-at")) {
+			if (left < 1 || arg_num(argv[++i], 0, 1e9, &replay_at)) {
+				fprintf(stderr, "--replay-at requires nonnegative finite seconds\n");
+				return 2;
 			}
 			replay_at_set = 1;
+		} else if (!strcmp(a, "--dump")) { if (left < 1 || arg_int(argv[++i], 1, 100000000, &dump)) bad = a; }
+		else if (!strcmp(a, "--shot-after")) { if (left < 1 || arg_int(argv[++i], 1, 1000000, &shot_after)) bad = a; }
+		else if (!strcmp(a, "--style")) { if (left < 1 || arg_int(argv[++i], 0, 2, &spec_style)) bad = a; }
+		else if (!strcmp(a, "--pal")) { if (left < 1 || arg_int(argv[++i], 0, NPAL - 1, &palette)) bad = a; }
+		else if (!strcmp(a, "--zoom")) {
+			if (left < 2 || arg_num(argv[i + 1], BAND_LO, BAND_HI, &zf) || arg_int(argv[i + 2], 1, 3, &zlevel))
+				bad = a;
+			i += 2;
+		} else if (!strcmp(a, "--burst")) {
+			if (left < 2 || arg_num(argv[i + 1], BAND_LO, BAND_HI, &burst_mhz) ||
+			    arg_int(argv[i + 2], 1, 86400, &burst_sec))
+				bad = a;
+			i += 2;
+		} else {
+			fprintf(stderr, "unknown option: %s (try --help)\n", a);
+			return 2;
 		}
-		else if (!strcmp(argv[i], "--probe"))
-			probe = 1;
-		else if (!strcmp(argv[i], "--raw-tune"))
-			raw_tune = 1;
-		else if (!strcmp(argv[i], "--zoom") && i + 2 < argc) {
-			zf = atof(argv[++i]);
-			zlevel = atoi(argv[++i]);
-		} else if (!strcmp(argv[i], "--burst") && i + 2 < argc) {
-			burst_mhz = atof(argv[++i]);
-			burst_sec = atoi(argv[++i]);
-		} else if (!strcmp(argv[i], "--racap")) {
-			racap = 1;
-		} else if (!strcmp(argv[i], "--style") && i + 1 < argc) {
-			spec_style = atoi(argv[++i]);
-		} else if (!strcmp(argv[i], "--pal") && i + 1 < argc) {
-			palette = atoi(argv[++i]);
-		} else if (!strcmp(argv[i], "--occ")) {
-			disp_mode = 1;
-		} else if (!strcmp(argv[i], "--shot-after") && i + 1 < argc) {
-			shot_after = atoi(argv[++i]);
-		} else if (!strcmp(argv[i], "--settings")) { /* tests: use settings.txt with options too */
-			use_settings = 1;
-		} else if (!strcmp(argv[i], "--pm-active")) {
-			pm_only = 1;
-		}
+	}
+	if (bad) {
+		fprintf(stderr, "%s: missing or out-of-range value (try --help)\n", bad);
+		return 2;
+	}
+	if (replay_at_set && !replay_path) {
+		fprintf(stderr, "--replay-at requires --replay FILE\n");
+		return 2;
+	}
+	if (review_only && shot && !replay_path) {
+		fprintf(stderr, "--shot needs --replay FILE in offline review\n");
+		return 2;
+	}
+	if (needs_radio) /* asked by launch.sh, which only takes Wi-Fi down for the radio */
+		return replay_path || review_only || fake || version ? 1 : 0;
+	if (version) {
+		printf("MiYooSDR %s\n", MIYOOSDR_VERSION);
+		return 0;
 	}
 
 	memset(&sa, 0, sizeof(sa));
@@ -2251,23 +3023,14 @@ int main(int argc, char **argv)
 	sigaction(SIGINT, &sa, NULL);
 	sigaction(SIGTERM, &sa, NULL);
 	sigaction(SIGHUP, &sa, NULL);
-	if (replay_at_set && !replay_path) {
-		fprintf(stderr, "--replay-at requires --replay FILE.pcap\n"); return 2;
-	}
+	fprintf(stderr, "MiYooSDR %s\n", MIYOOSDR_VERSION);
 	if (replay_path || review_only) {
 		int result;
-		if (review_only && shot && !replay_path) {
-			fprintf(stderr, "--shot requires --replay FILE.pcap in offline review\n"); return 2;
-		}
 		if (!shot && fb_open() != 0) { fprintf(stderr, "no framebuffer\n"); fb_close(); return 3; }
 		if (!shot && in_fd < 0) {
 			fprintf(stderr, "no input device for replay controls\n"); fb_close(); return 3;
 		}
-		make_lut();
-		view_full();
-		sweeps = 1; /* CSV review renders loaded traces without a live sweep. */
-		if (replay_path) result = packet_review(replay_path, shot, replay_at);
-		else { review_session(); result = 0; }
+		result = run_offline(replay_path, shot, replay_at);
 		fb_close();
 		return result;
 	}
@@ -2283,7 +3046,7 @@ int main(int argc, char **argv)
 	make_lut();
 	if (zlevel) {
 		view_zoom(zf, zlevel);
-		cursor = (int)((zf - vw.f0) / vw.bw);
+		cursor = mhz_bin(zf);
 	}
 
 	if (burst_sec) { /* single-channel high-rate power-vs-time recorder */
@@ -2291,17 +3054,11 @@ int main(int argc, char **argv)
 		double f0, t0b, tnow;
 		long nrows = 0;
 		char name[160];
-		time_t tt;
-		struct tm tm;
 		FILE *f;
 		if (ch < 1) ch = 1;
 		if (ch > 13) ch = 13;
 		f0 = ch_mhz(ch) - 64 * 0.3125;
-		mkdir("rec", 0755);
-		tt = time(NULL);
-		localtime_r(&tt, &tm);
-		snprintf(name, sizeof(name), "rec/burst-%04d%02d%02d-%02d%02d%02d.csv", tm.tm_year + 1900, tm.tm_mon + 1,
-		         tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+		timestamped_name(name, sizeof(name), "rec", "burst", "csv");
 		f = fopen(name, "w");
 		if (!f) {
 			fprintf(stderr, "cannot open %s\n", name);
@@ -2419,26 +3176,28 @@ int main(int argc, char **argv)
 
 	t0 = last_rate_t = last_flush = now_s();
 	while (!quit) {
-		do_sweep();
+		int fresh = do_sweep(); /* 0: a button changed the view mid-sweep */
 		if (review_request) { /* SELECT+START: browse and replay recordings */
 			review_request = 0;
 			review_session();
 			last_rate_t = last_flush = last_diag = now_s();
 			continue;
 		}
-		if (audio_on) { /* pitch tracks the level under the cursor */
-			float nn = (shown(sweep_db, cursor) - low()) / DB_SPAN;
-			audio_norm = nn < 0 ? 0 : nn > 1 ? 1 : nn;
+		if (fresh) {
+			if (audio_on) { /* pitch tracks the level under the cursor */
+				float nn = (shown(sweep_db, cursor) - low()) / DB_SPAN;
+				audio_norm = nn < 0 ? 0 : nn > 1 ? 1 : nn;
+			}
+			if (!scaled && sweeps >= 2)
+				autoscale();
+			push_waterfall();
+			record_sweep(t0);
+			burst_update(now_s());
 		}
 		if (now_s() - last_diag >= 2.0) {
 			diag("ui");
 			last_diag = now_s();
 		}
-		if (!scaled && sweeps >= 2)
-			autoscale();
-		push_waterfall();
-		record_sweep(t0);
-		burst_update(now_s());
 		if (now_s() - last_rate_t >= 1.0) {
 			rate = (sweeps - last_sweeps) / (now_s() - last_rate_t);
 			last_sweeps = sweeps;
@@ -2451,7 +3210,7 @@ int main(int argc, char **argv)
 		render();
 		if (shot) {
 			if (sweeps >= shot_after) {
-				write_image(shot);
+				shot_failed = write_image(shot) != 0;
 				break;
 			}
 			continue;
@@ -2460,8 +3219,6 @@ int main(int argc, char **argv)
 		if (shot_req) {
 			save_screenshot();
 			shot_req = 0;
-		} else if (sweeps == 20) { /* one automatic screenshot for checking the layout */
-			write_ppm("first.ppm");
 		}
 	}
 	if (use_settings)
@@ -2484,5 +3241,5 @@ int main(int argc, char **argv)
 	fb_close();
 	fprintf(stderr, "exit after %ld sweeps, %ld zero readings, %ld frozen sweeps, %ld remedies\n", sweeps, zeros,
 	        stuck_sweeps, remedies);
-	return 0;
+	return shot_failed;
 }

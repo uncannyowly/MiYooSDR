@@ -1,0 +1,6 @@
+{
+	"label": "MiYooSDR Replay",
+	"icon": "icon.png",
+	"launch": "launch.sh",
+	"description": "Play saved spectrum recordings and Wi-Fi captures; Wi-Fi stays on"
+}

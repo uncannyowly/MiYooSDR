@@ -1,24 +1,34 @@
 #!/bin/sh
-# MiYooSDR spike launcher (OnionOS, Miyoo Mini Plus).
-# Stops Wi-Fi management while the app sweeps (so nothing scans or retunes the
-# radio), then brings Wi-Fi back the way Onion starts it.
+# MiYooSDR launcher (OnionOS, Miyoo Mini Plus).
+# Live radio modes stop Wi-Fi management while the app sweeps (so nothing scans
+# or retunes the radio), then bring Wi-Fi back the way Onion starts it. Modes
+# that do not use the radio (replay, review, --fake, --version) leave Wi-Fi alone.
 # Extra arguments go to the binary (e.g. --dump 50 for a headless test).
 
 APPDIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$APPDIR" || exit 1
 LOG="$APPDIR/miyoosdr.log"
+RTL="${MIYOOSDR_RTL_PROC:-/proc/net/rtl8188fu/wlan0}"
 IW=/mnt/SDCARD/.tmp_update/bin/iw
 WPA=/mnt/SDCARD/miyoo/app/wpa_supplicant
 unset LD_PRELOAD
 export LD_LIBRARY_PATH="/config/lib:/customer/lib:$LD_LIBRARY_PATH"
+chmod +x "$APPDIR/miyoosdr" 2>/dev/null
 
-# Offline playback does not need radio setup or exclusive access to audio.
-for arg in "$@"; do
-	if [ "$arg" = --replay ] || [ "$arg" = --review ]; then
-		chmod +x "$APPDIR/miyoosdr"
-		exec "$APPDIR/miyoosdr" "$@"
-	fi
-done
+# The binary reads the options and says whether they need the radio (0), do
+# not (1), or are wrong (2, with a message), before anything is touched.
+"$APPDIR/miyoosdr" --needs-radio "$@"
+case $? in
+0) ;;
+1)
+	"$APPDIR/miyoosdr" "$@"
+	status=$?
+	# The app resumes Onion's menu if it paused it; this covers a crash.
+	pkill -CONT MainUI 2>/dev/null
+	exit $status
+	;;
+*) exit 2 ;;
+esac
 
 log() { echo "$(date +%T) $*" >> "$LOG"; }
 
@@ -53,24 +63,27 @@ restore() {
 
 : > "$LOG"
 log "start $*"
-if [ ! -d /proc/net/rtl8188fu/wlan0 ]; then
+if [ ! -d "$RTL" ]; then
 	log "no RTL8188FU wlan0 (Mini Plus only)"
 	exit 1
 fi
-trap restore EXIT INT TERM HUP
+# A signal exits, and the EXIT trap restores once; setup never resumes after it.
+trap restore EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 # switch the driver's power saving off while still associated (that is when
 # it takes effect); then stop Wi-Fi management so nothing scans or retunes
 # while we sweep. The app restores power saving when it exits.
-chmod +x "$APPDIR/miyoosdr"
 "$APPDIR/miyoosdr" --pm-active >> "$LOG" 2>&1
 sleep 0.3
 pkill -9 wpa_supplicant 2>/dev/null
 pkill -9 udhcpc 2>/dev/null
 ifconfig wlan0 up
 $IW dev wlan0 disconnect >> "$LOG" 2>&1
-echo "1 0 0" > /proc/net/rtl8188fu/wlan0/monitor
-cat /proc/net/rtl8188fu/wlan0/rf_info >> "$LOG" 2>&1
+echo "1 0 0" > "$RTL/monitor"
+cat "$RTL/rf_info" >> "$LOG" 2>&1
 
 # hand the audio device to the app (signal-to-sound). Onion gets it back on exit.
 if [ $had_audio = 1 ]; then
@@ -78,6 +91,7 @@ if [ $had_audio = 1 ]; then
 	sleep 0.2
 fi
 
-chmod +x "$APPDIR/miyoosdr"
 "$APPDIR/miyoosdr" "$@" >> "$LOG" 2>&1
-log "exit code $?"
+status=$?
+log "exit code $status"
+exit $status
