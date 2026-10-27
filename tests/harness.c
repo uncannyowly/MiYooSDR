@@ -81,6 +81,37 @@ static void *press_b_twice(void *arg)
 	return NULL;
 }
 
+static void *leave_scope_soon(void *arg) /* L2 after 0.7 s */
+{
+	(void)arg;
+	usleep(700000);
+	tap(KEY_TAB);
+	return NULL;
+}
+
+static void *record_then_leave(void *arg) /* X at 0.2 s, X at 0.6 s, L2 at 0.8 s */
+{
+	(void)arg;
+	usleep(200000);
+	tap(KEY_LEFTSHIFT);
+	usleep(400000);
+	tap(KEY_LEFTSHIFT);
+	usleep(200000);
+	tap(KEY_TAB);
+	return NULL;
+}
+
+/* 3000 samples a second: quiet at 45 dB, hits of 1 ms at 70 dB 20 ms apart */
+static void feed_burst_pattern(struct scope_state *s, long *n, double from, double to, double burst_at)
+{
+	for (; *n < (long)(to * 3000); (*n)++) {
+		double t = *n / 3000.0, in = t - burst_at;
+		int hit = burst_at >= 0 && in >= 0 && in < 0.2 && fmod(in, 0.020) < 0.001 - 1e-9;
+		(void)from;
+		scope_feed(s, *n, t, hit ? 70.0f : 45.0f);
+	}
+}
+
 static int load_or_report(const char *path, struct recording *r)
 {
 	char error[160];
@@ -197,8 +228,14 @@ int main(int argc, char **argv)
 			return 1;
 		n = list_recordings(&list);
 		for (k = 0; k < n; k++)
-			printf("%c %s\n", list[k].packet ? 'P' : 'C', list[k].path);
+			printf("%c %s\n", "CPS"[list[k].kind], list[k].path);
 		free(list);
+	} else if (!strcmp(what, "scope-replay") && argc > 3) { /* render one replay frame, read its burst line */
+		make_lut();
+		if (scope_replay(argv[2], "/dev/null", atof(argv[3])))
+			return 1;
+		printf("burst %d hits %d gap %d\n", find_text("LAST BURST #1: 181ms"), find_text("10 hits"),
+		       find_text("every 20ms"));
 	} else if (!strcmp(what, "replay-back") && argc > 2) { /* --replay FILE, then B, then B */
 		pthread_t presser;
 		char left;
@@ -245,6 +282,110 @@ int main(int argc, char **argv)
 		review_draw(&r, (size_t)atoi(argv[3]), 1, 0, "x.csv");
 		printf("render footer pixels %d review help %d\n", footer, find_text("A play"));
 		recording_free(&r);
+	} else if (!strcmp(what, "persist")) { /* a steady 70 dB carrier in bin 10 over a 45 dB floor */
+		int r, peak_row = -1, s;
+		unsigned hot = 0;
+		view_full();
+		db_low = 40.0f;
+		for (s = 0; s < 40; s++) {
+			for (i = 0; i < vw.nb; i++)
+				sweep_db[i] = i == 10 ? 70.0f : 45.0f;
+			persist_add();
+		}
+		for (r = 0; r < WHGT; r++)
+			if (persist[10][r] > hot) {
+				hot = persist[10][r];
+				peak_row = r;
+			}
+		printf("peak row %d of %d\n", peak_row, WHGT);
+		for (s = 0; s < 200; s++) { /* the carrier goes away */
+			for (i = 0; i < vw.nb; i++)
+				sweep_db[i] = 45.0f;
+			persist_add();
+		}
+		printf("decayed %u%%\n", hot ? (unsigned)(100.0 * persist[10][peak_row] / hot) : 999);
+		db_low = 43.0f; /* a new level range starts the picture over */
+		persist_add();
+		printf("after range change %u\n", (unsigned)persist[10][peak_row]);
+	} else if (!strcmp(what, "persist-panel")) {
+		make_lut();
+		view_full();
+		disp_mode = 2;
+		sweeps = 3;
+		render();
+		printf("title %d\n", find_text("PERSISTENCE"));
+	} else if (!strcmp(what, "panels")) { /* SELECT + B, three times */
+		for (i = 0; i < 3; i++) {
+			sel_layer(KEY_LEFTCTRL);
+			printf("%d ", disp_mode);
+		}
+		printf("\n");
+	} else if (!strcmp(what, "scope-feed")) { /* two bursts of 10 hits, 1.3 s apart */
+		struct scope_state s;
+		long n = 0;
+		memset(&s, 0, sizeof(s));
+		feed_burst_pattern(&s, &n, 0, 1.0, -1);
+		feed_burst_pattern(&s, &n, 1.0, 2.3, 1.0);
+		feed_burst_pattern(&s, &n, 2.3, 3.0, 2.3);
+		printf("bursts %ld hits %d gap %.2f len %.2f interval %.3f\n", s.bursts, s.last_hits, s.last_gap * 1000,
+		       s.last_len * 1000, s.interval);
+	} else if (!strcmp(what, "scope-sparse")) { /* 21 readings 0.5 ms apart across a 10 ms panel */
+		struct scope_state s;
+		int x, y, first = -1, last = -1, covered = 0;
+		memset(&s, 0, sizeof(s));
+		make_lut();
+		db_low = 40.0f;
+		for (i = 0; i <= 20; i++) {
+			scope_ring[i].t = i * 0.0005;
+			scope_ring[i].db10 = (int16_t)(i % 2 ? 700 : 500);
+		}
+		scope_trace(WY0, WHGT - 18, 0, 21, 0.0, 0.0105, &s);
+		for (x = 0; x < PW; x++) {
+			int drawn = 0;
+			for (y = WY0; y < WY0 + WHGT - 18 && !drawn; y++) {
+				uint32_t c = canvas[y * SW + PX0 + x];
+				drawn = c != C_PANEL && c != C_GRID;
+			}
+			if (drawn) {
+				covered++;
+				if (first < 0)
+					first = x;
+				last = x;
+			}
+		}
+		printf("covered %d of %d\n", covered, last - first + 1);
+	} else if (!strcmp(what, "scope-enter")) { /* R2 at the 5 MHz zoom */
+		view_zoom(2440.0, 3);
+		cursor = 64;
+		on_button(KEY_BACKSPACE);
+		printf("scope request %d at %.4f\n", scope_request, scope_request_mhz);
+	} else if (!strcmp(what, "scope-run")) {
+		pthread_t presser;
+		fake = 1;
+		make_lut();
+		keys_open();
+		pthread_create(&presser, NULL, leave_scope_soon, NULL);
+		scope_session(2447.3, NULL);
+		pthread_join(presser, NULL);
+		printf("samples %ld rate %.0f level %d cursor %.4f\n", scope_samples, scope_samples / scope_seconds,
+		       vw.level, bin_mhz(cursor));
+	} else if (!strcmp(what, "scope-rec") && argc > 2) {
+		pthread_t presser;
+		if (chdir(argv[2]))
+			return 1;
+		fake = 1;
+		make_lut();
+		keys_open();
+		pthread_create(&presser, NULL, record_then_leave, NULL);
+		scope_session(2447.3, NULL);
+		pthread_join(presser, NULL);
+		printf("samples %ld\n", scope_samples);
+	} else if (!strcmp(what, "settings-panel") && argc > 2) {
+		if (chdir(argv[2]))
+			return 1;
+		view_full();
+		settings_load();
+		printf("panel %d\n", disp_mode);
 	} else {
 		fprintf(stderr, "unknown scenario %s\n", what);
 		return 2;

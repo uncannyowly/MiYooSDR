@@ -30,6 +30,7 @@
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -86,7 +87,6 @@ static volatile int audio_quiet; /* fade the tone out (screens with no level to 
 static int audio_on;
 
 #ifdef MIYOO
-#include <pthread.h>
 #include <dlfcn.h>
 #include <mi_ao.h>
 #include <mi_sys.h>
@@ -640,6 +640,7 @@ static double status_until;
 static void poll_input(void);
 static void status(const char *msg);
 static void update_occupancy(void);
+static void persist_add(void);
 static void burst_reset(void);
 
 static float to_db(unsigned v, float prev, int gain)
@@ -779,6 +780,7 @@ static int do_sweep(void)
 	have_hold = have_avg = have_base = 1;
 	if (vw.level == 0)
 		update_occupancy();
+	persist_add();
 	sweeps++;
 	return 1;
 }
@@ -973,11 +975,35 @@ static void autoscale(void)
 	scaled = 1;
 }
 
+/* persistence: how often each level shows up in each bin, fading over time.
+ * Steady carriers become bright lines, busy channels clouds, rare hits dots. */
+static uint16_t persist[MAXBINS][WHGT]; /* [bin][row], row 0 = bottom of the dB range */
+static float persist_low;                /* the dB range it was built for */
+static int persist_enh = -1;
+
+static void persist_add(void)
+{
+	int i, r;
+	if (persist_low != low() || persist_enh != enhance) { /* another range: start over */
+		memset(persist, 0, sizeof(persist));
+		persist_low = low();
+		persist_enh = enhance;
+	}
+	for (i = 0; i < vw.nb; i++) {
+		float t = (shown(sweep_db, i) - low()) / DB_SPAN;
+		for (r = 0; r < WHGT; r++) /* fade by 1/32 a sweep, rounding up so it reaches 0 */
+			persist[i][r] -= (uint16_t)((persist[i][r] + 31) >> 5);
+		r = t <= 0 ? 0 : t >= 1 ? WHGT - 1 : (int)lround(t * (WHGT - 1));
+		persist[i][r] = persist[i][r] > 65535 - 1024 ? 65535 : persist[i][r] + 1024;
+	}
+}
+
 static void reset_traces(void)
 {
 	have_hold = have_avg = have_base = 0;
 	wf_rows = 0;
 	scaled = 0;
+	persist_enh = -1;
 	burst_reset();
 }
 
@@ -1032,8 +1058,11 @@ static void draw_fill(const float *v)
 }
 
 /* per Wi-Fi-channel activity (dB above the noise floor), fed by full-band sweeps */
-static int disp_mode; /* 0 waterfall, 1 channel occupancy */
+static int disp_mode; /* lower panel: 0 waterfall, 1 channel occupancy, 2 persistence */
 static int review_request;  /* SELECT+START asks to open a saved recording */
+static int scope_request;   /* R2 at the 5 MHz zoom asks for the scope */
+static double scope_request_mhz;
+static int shot_after = 12;  /* --shot-after: live sweeps (scope: x128 readings) before --shot */
 static float occ[15], occ_pk[15];
 
 static void update_occupancy(void)
@@ -1095,6 +1124,44 @@ static void draw_occupancy(void)
 	text(PX0 + PW - (int)strlen(s) * 8, WY0, vw.level ? C_DIM : C_LIVE, s);
 }
 
+static void draw_persistence(void)
+{
+	static uint32_t colour[1024]; /* by count >> 6, on a log scale up to the busiest cell */
+	unsigned top = 1;
+	double norm;
+	char s[16];
+	int i, r, k, w = PW / vw.nb;
+	fill(PX0, WY0, PW, WHGT, C_PANEL);
+	for (i = 0; i < vw.nb; i++)
+		for (r = 0; r < WHGT; r++)
+			if (persist[i][r] > top)
+				top = persist[i][r];
+	norm = 255.0 / log1p((double)top);
+	for (k = 0; k < 1024; k++) {
+		int level = (int)(log1p(k * 64.0 + 32) * norm);
+		colour[k] = lut[level > 255 ? 255 : level];
+	}
+	for (i = 0; i <= 48; i += 12) { /* the spectrum's dB scale, bottom to top */
+		int y = WY0 + WHGT - 1 - i * (WHGT - 1) / 48;
+		for (k = PX0; k < PX0 + PW; k += 4)
+			canvas[y * SW + k] = C_GRID;
+		snprintf(s, sizeof(s), enhance ? "%+3.0f" : "%3.0f", low() + i);
+		text(PX0 - 34, y - 8, C_DIM, s);
+	}
+	for (i = 0; i < vw.nb; i++)
+		for (r = 0; r < WHGT; r++) {
+			unsigned v = persist[i][r];
+			uint32_t *dst, c;
+			if (!v)
+				continue;
+			c = colour[v >> 6];
+			dst = canvas + (WY0 + WHGT - 1 - r) * SW + PX0 + i * w;
+			for (k = 0; k < w; k++)
+				dst[k] = c;
+		}
+	text(PX0 + 4, WY0, C_DIM, "PERSISTENCE: how often each level shows up");
+}
+
 /* what uses frequency f (MHz): Bluetooth LE (40 channels 2 MHz apart from 2402; 37, 38
  * and 39 are the advertising channels that beacons and most remotes use), Wi-Fi
  * (channels 1-13, 20 MHz wide) and Zigbee / 802.15.4 (channels 11-26, 2 MHz wide) */
@@ -1120,6 +1187,27 @@ static int zigbee_channel(double f)
 {
 	int k = (int)lround((f - 2405.0) / 5.0) + 11;
 	return k >= 11 && k <= 26 && fabs(f - (2405.0 + 5.0 * (k - 11))) <= 1.5 ? k : -1;
+}
+
+/* what frequency fc is used for, in the right-hand column from row y down */
+static void draw_channel_names(double fc, int y)
+{
+	char s[16];
+	int adv = 0, b = ble_channel(fc, &adv), w = wifi_channel(fc), z = zigbee_channel(fc);
+	if (b >= 0) {
+		snprintf(s, sizeof(s), adv ? "ADV %d" : "BLE %d", b);
+		text(PX0 + PW + 6, y, adv ? C_HOLD : C_TEXT, s);
+		y += 16;
+	}
+	if (w > 0) {
+		snprintf(s, sizeof(s), "WiFi %d", w);
+		text(PX0 + PW + 6, y, C_TEXT, s);
+		y += 16;
+	}
+	if (z > 0) {
+		snprintf(s, sizeof(s), "ZB %d", z);
+		text(PX0 + PW + 6, y, C_TEXT, s);
+	}
 }
 
 /* bursts at the cursor: the level rises 8 dB over the background, then falls back
@@ -1314,29 +1402,15 @@ static void render(void)
 	text(PX0 + PW + 6, SY0 + 82, C_DIM, s);
 	text(PX0 + PW + 6, SY0 + 98, C_DIM, pal_name[palette]);
 
-	/* what the cursor frequency is used for */
-	{
-		double fc = bin_mhz(cursor);
-		int adv = 0, b = ble_channel(fc, &adv), w = wifi_channel(fc), z = zigbee_channel(fc), yy = SY0 + 122;
-		if (b >= 0) {
-			snprintf(s, sizeof(s), adv ? "ADV %d" : "BLE %d", b);
-			text(PX0 + PW + 6, yy, adv ? C_HOLD : C_TEXT, s);
-			yy += 16;
-		}
-		if (w > 0) {
-			snprintf(s, sizeof(s), "WiFi %d", w);
-			text(PX0 + PW + 6, yy, C_TEXT, s);
-			yy += 16;
-		}
-		if (z > 0) {
-			snprintf(s, sizeof(s), "ZB %d", z);
-			text(PX0 + PW + 6, yy, C_TEXT, s);
-		}
-	}
+	draw_channel_names(bin_mhz(cursor), SY0 + 122);
 
 	/* lower panel: waterfall (newest on top) or channel occupancy */
 	if (disp_mode == 1) {
 		draw_occupancy();
+	} else if (disp_mode == 2) {
+		draw_persistence();
+		for (y = WY0; y < WY0 + WHGT; y += 3)
+			canvas[y * SW + x] = C_CURSOR;
 	} else {
 		for (y = 0; y < wf_rows; y++) {
 			const uint8_t *row = wf[(wf_head + y) % WHGT];
@@ -1953,7 +2027,7 @@ static void settings_load(void)
 			continue;
 		if (!strcmp(key, "palette") && v >= 0 && v < NPAL) palette = (int)v;
 		else if (!strcmp(key, "style") && v >= 0 && v <= 2) spec_style = (int)v;
-		else if (!strcmp(key, "panel")) disp_mode = v != 0;
+		else if (!strcmp(key, "panel") && v >= 0 && v <= 2) disp_mode = (int)v;
 		else if (!strcmp(key, "enhance")) enhance = v != 0;
 		else if (!strcmp(key, "hold")) show_hold = v != 0;
 		else if (!strcmp(key, "zoom") && v >= 0 && v <= 3) zoom = (int)v;
@@ -2024,7 +2098,8 @@ static void set_view_zoom(double target, int level)
 	} else {
 		view_zoom(target, level);
 		cursor = mhz_bin(target);
-		snprintf(m, sizeof(m), "zoom %.0f MHz around %.2f MHz (ch %d)", vw.nb * vw.bw, bin_mhz(cursor), vw.ch);
+		snprintf(m, sizeof(m), "zoom %.0f MHz around %.2f MHz (ch %d)%s", vw.nb * vw.bw, bin_mhz(cursor), vw.ch,
+		         vw.level == 3 ? "; R2 again for the scope" : "");
 	}
 	view_gen++;
 	reset_traces();
@@ -2092,9 +2167,13 @@ static void on_button(int code)
 		else if (vw.level)
 			set_view_zoom(fcur + vw.nb * vw.bw / 4, vw.level);
 		break;
-	case KEY_BACKSPACE: /* R2: zoom in at the cursor */
-		if (vw.level < 3)
+	case KEY_BACKSPACE: /* R2: zoom in at the cursor, past 5 MHz into the scope */
+		if (vw.level < 3) {
 			set_view_zoom(fcur, vw.level + 1);
+		} else {
+			scope_request = 1;
+			scope_request_mhz = fcur;
+		}
 		break;
 	case KEY_TAB: /* L2: zoom out */
 		if (vw.level > 0)
@@ -2121,9 +2200,9 @@ static void sel_layer(int code)
 		snprintf(m, sizeof(m), "palette: %s", pal_name[palette]);
 		status(m);
 		break;
-	case KEY_LEFTCTRL: /* SEL + B: waterfall <-> channel occupancy */
-		disp_mode ^= 1;
-		status(disp_mode ? "channel occupancy" : "waterfall");
+	case KEY_LEFTCTRL: /* SEL + B: waterfall -> channel occupancy -> persistence */
+		disp_mode = (disp_mode + 1) % 3;
+		status(disp_mode == 1 ? "channel occupancy" : disp_mode == 2 ? "persistence" : "waterfall");
 		break;
 	case KEY_LEFTSHIFT: /* SEL + X: signal-to-sound */
 		if (audio_on) {
@@ -2162,6 +2241,501 @@ static void on_signal(int sig)
 {
 	(void)sig;
 	quit = 1;
+}
+
+/* ------------------------------------------------------------- scope mode */
+/* One frequency read over and over: about 3,000 readings a second with the
+ * 128-point FFT (a 312.5 kHz wide bin), so the shape and timing of short bursts
+ * show up, where sweeps come back to a frequency only every 40-200 ms. A thread
+ * reads the radio into a ring while the screen shows a rolling trace, the last
+ * burst stretched out, and its timing. R2 at the 5 MHz zoom opens it. */
+#define SCOPE_RING (1u << 17) /* readings kept: about 40 s */
+#define SCOPE_TONE_MHZ 0.3125 /* 40 MHz / 128 points */
+#define SCOPE_WARMUP 600      /* readings that only teach the background */
+
+struct scope_reading {
+	double t;     /* s since the scope started */
+	int16_t db10; /* dB*10, uncalibrated */
+	uint8_t gain;
+};
+
+static struct scope_reading scope_ring[SCOPE_RING];
+static unsigned scope_head; /* readings written so far (atomic; counts past the ring size) */
+static int scope_run, scope_ch, scope_tone, scope_gain; /* shared with the reader: atomic access */
+static long scope_samples;   /* the last session's readings */
+static double scope_seconds; /* and its length */
+
+/* Bursts: a hit starts at max(SCOPE_ON, 5 spreads) dB over the background and
+ * ends under max(SCOPE_OFF, 3 spreads), and hits closer together than
+ * SCOPE_QUIET make one burst. The background and the noise spread learn from the
+ * readings between bursts only, so a long burst does not raise its own floor. */
+#define SCOPE_ON 8.0f
+#define SCOPE_OFF 5.0f
+#define SCOPE_QUIET 0.050
+
+struct scope_state {
+	float bg, spread;
+	int have_bg, on, active, hits, gaps, last_hits;
+	long seen, bursts, first, last_first, last_end;
+	double hit_start, hit_end, burst_start, gap_sum;
+	double last_start, last_len, last_gap, interval;
+};
+
+static float scope_on_level(const struct scope_state *s)
+{
+	return s->bg + (s->spread * 5 > SCOPE_ON ? s->spread * 5 : SCOPE_ON);
+}
+
+static void scope_feed(struct scope_state *s, long n, double t, float db)
+{
+	float off;
+	if (!s->have_bg) {
+		s->bg = db;
+		s->have_bg = 1;
+	}
+	off = s->bg + (s->spread * 3 > SCOPE_OFF ? s->spread * 3 : SCOPE_OFF);
+	if (!s->on && s->seen >= SCOPE_WARMUP && db > scope_on_level(s)) {
+		s->on = 1;
+		if (!s->active) {
+			s->active = 1;
+			if (s->bursts)
+				s->interval = t - s->burst_start;
+			s->bursts++;
+			s->burst_start = t;
+			s->first = n;
+			s->hits = s->gaps = 0;
+			s->gap_sum = 0;
+		} else {
+			s->gap_sum += t - s->hit_start;
+			s->gaps++;
+		}
+		s->hit_start = t;
+		s->hits++;
+	} else if (s->on && db < off) {
+		s->on = 0;
+		s->hit_end = t;
+	}
+	if (s->active && !s->on && t - s->hit_end > SCOPE_QUIET) {
+		s->active = 0;
+		s->last_start = s->burst_start;
+		s->last_len = s->hit_end - s->burst_start;
+		s->last_hits = s->hits;
+		s->last_gap = s->gaps ? s->gap_sum / s->gaps : 0;
+		s->last_first = s->first;
+		s->last_end = n;
+	}
+	if (!s->active && !s->on) { /* between bursts: learn the floor and its spread */
+		s->bg += 0.002f * (db - s->bg);
+		s->spread += 0.002f * (fabsf(db - s->bg) - s->spread);
+	}
+	s->seen++;
+}
+
+/* channel and 128-point tone for mhz, 2.5-7.5 MHz off the LO as in the zoom;
+ * returns the frequency that tone measures */
+static double scope_plan(double mhz, int *ch, int *tone)
+{
+	int c, best = 1, t;
+	double bestscore = 1e9;
+	if (!(mhz >= BAND_LO)) /* also NaN */
+		mhz = BAND_LO;
+	if (mhz > BAND_HI)
+		mhz = BAND_HI;
+	for (c = 1; c <= 13; c++) {
+		double score = fabs(fabs(mhz - ch_mhz(c)) - 5.0);
+		if (score < bestscore) {
+			bestscore = score;
+			best = c;
+		}
+	}
+	t = (int)lround((mhz - ch_mhz(best)) / SCOPE_TONE_MHZ);
+	if (t < -63) t = -63;
+	if (t > 63) t = 63;
+	*ch = best;
+	*tone = t;
+	return ch_mhz(best) + t * SCOPE_TONE_MHZ;
+}
+
+/* the only user of the radio while the scope is open */
+static void *scope_reader(void *arg)
+{
+	double t0 = now_s();
+	int gain = -1, ch = -1, tone;
+	float prev = (float)__atomic_load_n(&scope_gain, __ATOMIC_RELAXED);
+	(void)arg;
+	while (__atomic_load_n(&scope_run, __ATOMIC_RELAXED) && !radio_dead) {
+		unsigned head = __atomic_load_n(&scope_head, __ATOMIC_RELAXED);
+		struct scope_reading *r = &scope_ring[head & (SCOPE_RING - 1)];
+		unsigned v;
+		float db;
+		if (__atomic_load_n(&scope_gain, __ATOMIC_RELAXED) != gain) {
+			gain = __atomic_load_n(&scope_gain, __ATOMIC_RELAXED);
+			if (!fake)
+				set_igi(gain);
+		}
+		if (__atomic_load_n(&scope_ch, __ATOMIC_RELAXED) != ch) {
+			ch = __atomic_load_n(&scope_ch, __ATOMIC_RELAXED);
+			if (!fake) {
+				tune(ch);
+				(void)psd_point(0, 0); /* settle */
+			}
+		}
+		tone = __atomic_load_n(&scope_tone, __ATOMIC_RELAXED);
+		v = fake ? fake_point(ch, tone, 0) : psd_point(tone, 0);
+		db = to_db(v, prev, gain);
+		prev = db;
+		r->t = now_s() - t0;
+		r->db10 = (int16_t)lrintf(db * 10);
+		r->gain = (uint8_t)gain;
+		__atomic_store_n(&scope_head, head + 1, __ATOMIC_RELEASE);
+		if (fake) /* about the Mini's reading rate */
+			spin_us(300);
+	}
+	return NULL;
+}
+
+static const double scope_spans[] = { 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10 };
+#define SCOPE_SPANS (int)(sizeof(scope_spans) / sizeof(scope_spans[0]))
+
+static int scope_y(int y0, int h, float db)
+{
+	float t = (db - low()) / DB_SPAN;
+	if (t < 0) t = 0;
+	if (t > 1) t = 1;
+	return y0 + h - 1 - (int)(t * (h - 1));
+}
+
+static void scope_secs(char *out, size_t n, double v) /* short durations to 0.1 ms */
+{
+	if (v < 0.01)
+		snprintf(out, n, "%.1fms", v * 1000);
+	else if (v < 1)
+		snprintf(out, n, "%.0fms", v * 1000);
+	else
+		snprintf(out, n, v < 100 ? "%.1fs" : "%.0fs", v);
+}
+
+/* Readings with t0 <= t < t0 + span as min..max lines per column, newest first
+ * from ring number `to` back to `from`; with the background and hit level dotted. */
+static void scope_trace(int y0, int h, unsigned from, unsigned to, double t0, double span,
+                        const struct scope_state *s)
+{
+	static float mn[PW], mx[PW], newest[PW];
+	char lbl[16];
+	unsigned i;
+	int x, y, k, held = 0, last_x = -1;
+	float hold = 0;
+	fill(PX0, y0, PW, h, C_PANEL);
+	for (k = 0; k <= 48; k += 12) {
+		y = scope_y(y0, h, low() + k);
+		for (x = PX0; x < PX0 + PW; x += 4)
+			canvas[y * SW + x] = C_GRID;
+		snprintf(lbl, sizeof(lbl), "%3.0f", low() + k);
+		text(PX0 - 34, y - 8, C_DIM, lbl);
+	}
+	for (x = 0; x < PW; x++) {
+		mn[x] = 1e9f;
+		mx[x] = -1e9f;
+	}
+	for (i = to; i != from;) {
+		const struct scope_reading *r = &scope_ring[--i & (SCOPE_RING - 1)];
+		float db = r->db10 / 10.0f;
+		if (r->t < t0)
+			break;
+		if (r->t >= t0 + span)
+			continue;
+		x = (int)((r->t - t0) / span * PW);
+		if (x < 0 || x >= PW)
+			continue;
+		if (mx[x] < -1e8f) /* met newest first */
+			newest[x] = db;
+		if (db < mn[x]) mn[x] = db;
+		if (db > mx[x]) mx[x] = db;
+		if (x > last_x)
+			last_x = x;
+	}
+	if (s->have_bg) {
+		int ybg = scope_y(y0, h, s->bg), yon = scope_y(y0, h, scope_on_level(s));
+		for (x = PX0; x < PX0 + PW; x += 3) {
+			canvas[ybg * SW + x] = C_AVG;
+			canvas[yon * SW + x] = C_HOLD;
+		}
+	}
+	/* each column from its lowest to highest reading; between readings the last
+	 * one holds, stepping to the next, so a sparse window still reads as a trace */
+	for (x = 0; x <= last_x; x++) {
+		float lo, hi, frac;
+		if (mx[x] < -1e8f) {
+			if (!held)
+				continue;
+			lo = hi = hold;
+		} else {
+			lo = mn[x];
+			hi = mx[x];
+			if (held) {
+				if (hold < lo) lo = hold;
+				if (hold > hi) hi = hold;
+			}
+			hold = newest[x];
+			held = 1;
+		}
+		frac = (hi - low()) / DB_SPAN;
+		line(PX0 + x, scope_y(y0, h, hi), PX0 + x, scope_y(y0, h, lo),
+		     pal_color(0.25f + 0.75f * (frac < 0 ? 0 : frac > 1 ? 1 : frac)));
+	}
+}
+
+/* ticks at a 1, 2 or 5 step under a panel, labelled from origin (s or ms) */
+static void scope_time_axis(int y, double t0, double span, double origin, int ms)
+{
+	double step = pow(10, floor(log10(span / 5))), v;
+	char lbl[24];
+	if (span / step > 12) step *= 5;
+	else if (span / step > 6) step *= 2;
+	for (v = ceil((t0 - origin) / step) * step; v <= t0 - origin + span + 1e-12; v += step) {
+		int x = PX0 + (int)lround((v + origin - t0) / span * (PW - 1));
+		line(x, y - 3, x, y - 1, C_AXIS);
+		if (ms)
+			snprintf(lbl, sizeof(lbl), "%g", fabs(v) < 1e-12 ? 0 : v * 1000);
+		else if (fabs(v) < 1e-12)
+			snprintf(lbl, sizeof(lbl), "now");
+		else
+			snprintf(lbl, sizeof(lbl), "%gs", v);
+		text(x - (int)strlen(lbl) * 4, y, C_DIM, lbl);
+	}
+	if (ms)
+		text(PX0 + PW + 6, y, C_DIM, "ms");
+}
+
+static void scope_draw(const struct scope_state *s, double mhz, int ch, int tone, unsigned from, unsigned to,
+                       int span_i, int hold, double rate, int recording)
+{
+	char t[160];
+	int x = PX0 + PW + 6, y;
+	double span = scope_spans[span_i], t_end = 0;
+	float now_db = 0;
+	if (to != from) {
+		const struct scope_reading *r = &scope_ring[(to - 1) & (SCOPE_RING - 1)];
+		t_end = r->t;
+		now_db = r->db10 / 10.0f;
+	}
+	fill(0, 0, SW, SH, C_BG);
+	text(4, 2, C_TEXT, "MiYooSDR");
+	snprintf(t, sizeof(t), "SCOPE ch%d tone %+d, 312 kHz  %.1fk/s  gain %02X%s", ch, tone, rate / 1000, igi,
+	         hold ? "  HOLD" : "");
+	text(76, 2, C_ZOOM, t);
+	if (audio_on)
+		text(SW - 92, 2, C_LIVE, "SND");
+	if (recording) {
+		fill(SW - 52, 6, 8, 8, C_REC);
+		text(SW - 40, 2, C_REC, "REC");
+	}
+
+	scope_trace(SY0, SHGT, from, to, t_end - span, span, s);
+	scope_time_axis(SY0 + SHGT + 2, t_end - span, span, t_end, 0);
+
+	if (s->last_hits && to - (unsigned)s->last_first < SCOPE_RING - 4096) { /* still in the ring */
+		double pad = s->last_len * 0.1 > 0.002 ? s->last_len * 0.1 : 0.002;
+		double ta = s->last_start - pad, tb = s->last_start + s->last_len + pad;
+		char len[16], gap[16];
+		scope_trace(WY0, WHGT - 18, from, (unsigned)s->last_end + 1, ta, tb - ta, s);
+		scope_time_axis(WY0 + WHGT - 16, ta, tb - ta, s->last_start, 1);
+		scope_secs(len, sizeof(len), s->last_len);
+		scope_secs(gap, sizeof(gap), s->last_gap);
+		snprintf(t, sizeof(t), "LAST BURST #%ld: %s, %d hit%s%s%s", s->bursts - s->active, len, s->last_hits,
+		         s->last_hits == 1 ? "" : "s", s->last_hits > 1 ? ", every " : "", s->last_hits > 1 ? gap : "");
+		text(PX0 + 4, WY0 + 2, C_DIM, t);
+	} else {
+		fill(PX0, WY0, PW, WHGT - 18, C_PANEL);
+		text(PX0 + 8, WY0 + 8, C_DIM, "LAST BURST: none yet");
+		text(PX0 + 8, WY0 + 30, C_DIM, "A hit is a reading over the yellow line,");
+		text(PX0 + 8, WY0 + 48, C_DIM, "well above the background (blue).");
+	}
+
+	snprintf(t, sizeof(t), "%.2f", mhz);
+	text(x, SY0 + 2, C_CURSOR, t);
+	if (to != from) {
+		snprintf(t, sizeof(t), "now %3.0f", now_db);
+		text(x, SY0 + 22, C_LIVE, t);
+	}
+	if (s->have_bg) {
+		snprintf(t, sizeof(t), "bg  %3.0f", s->bg);
+		text(x, SY0 + 40, C_AVG, t);
+		snprintf(t, sizeof(t), "hit %3.0f", scope_on_level(s));
+		text(x, SY0 + 58, C_HOLD, t);
+	}
+	draw_channel_names(mhz, SY0 + 82);
+
+	y = WY0 + 26;
+	text(x, y, C_DIM, "BURSTS");
+	snprintf(t, sizeof(t), "%ld", s->bursts);
+	text(x, y + 16, s->active ? C_LIVE : C_TEXT, t);
+	text(x, y + 40, C_DIM, "last");
+	if (s->bursts)
+		scope_secs(t, sizeof(t), t_end - (s->active ? s->burst_start : s->last_start));
+	else
+		snprintf(t, sizeof(t), "-");
+	text(x, y + 56, C_TEXT, t);
+	text(x, y + 80, C_DIM, "every");
+	if (s->bursts > 1)
+		scope_secs(t, sizeof(t), s->interval);
+	else
+		snprintf(t, sizeof(t), "-");
+	text(x, y + 96, C_TEXT, t);
+	text(x, y + 120, C_DIM, "hits");
+	snprintf(t, sizeof(t), "%d", s->active ? s->hits : s->last_hits);
+	text(x, y + 136, C_TEXT, t);
+
+	if (status_until > now_s())
+		text(4, SH - 17, C_TEXT, status_msg);
+	else
+		text(4, SH - 17, C_DIM, "L/R tune  SEL+L/R time  Up/Dn range  L1/R1 gain  A hold  X rec  B clear  L2 back");
+}
+
+static FILE *scope_rec_open(char *path, size_t n, double mhz, int ch, int tone)
+{
+	FILE *f;
+	timestamped_name(path, n, "rec", "scope", "csv");
+	f = fopen(path, "w");
+	if (f) {
+		fprintf(f, "# MiYooSDR scope recording: %.4f MHz (ch %d, tone %d of 128, 0.3125 MHz wide)\n", mhz, ch,
+		        tone);
+		fprintf(f, "# columns: seconds, gain(IGI), dB*10 (uncalibrated)\n");
+	}
+	return f;
+}
+
+/* Runs until L2 (back to the 5 MHz zoom around it) or MENU. With shot, renders
+ * once shot_after * 128 readings are in, writes the image and returns whether
+ * that failed. */
+static int scope_session(double want_mhz, const char *shot)
+{
+	static struct scope_state st;
+	pthread_t reader;
+	FILE *recf = NULL;
+	char rec_path[160], m[200];
+	double mhz, t_start = now_s(), rate = 0, rate_t = t_start;
+	unsigned tail = 0, from = 0, rate_n = 0;
+	int ch, tone, span_i = 4, hold = 0, back = 0, result = 0, code;
+
+	memset(&st, 0, sizeof(st));
+	mhz = scope_plan(want_mhz, &ch, &tone);
+	__atomic_store_n(&scope_ch, ch, __ATOMIC_RELAXED);
+	__atomic_store_n(&scope_tone, tone, __ATOMIC_RELAXED);
+	__atomic_store_n(&scope_gain, igi, __ATOMIC_RELAXED);
+	__atomic_store_n(&scope_head, 0, __ATOMIC_RELEASE);
+	__atomic_store_n(&scope_run, 1, __ATOMIC_RELAXED);
+	if (pthread_create(&reader, NULL, scope_reader, NULL) != 0) {
+		status("cannot start the scope");
+		return 1;
+	}
+	audio_quiet = 0;
+	snprintf(m, sizeof(m), "scope on %.3f MHz; L2 goes back to the zoom", mhz);
+	status(m);
+	while (!quit && !back) {
+		unsigned head = __atomic_load_n(&scope_head, __ATOMIC_ACQUIRE);
+		double t = now_s();
+		if (head - tail > SCOPE_RING / 2) /* held a long time: skip ahead */
+			tail = from = head - SCOPE_RING / 4;
+		if (!hold)
+			for (; tail != head; tail++) {
+				const struct scope_reading *r = &scope_ring[tail & (SCOPE_RING - 1)];
+				scope_feed(&st, (long)tail, r->t, r->db10 / 10.0f);
+				if (recf)
+					fprintf(recf, "%.5f,%d,%d\n", r->t, r->gain, r->db10);
+			}
+		if (t - rate_t >= 1.0) {
+			rate = (head - rate_n) / (t - rate_t);
+			rate_n = head;
+			rate_t = t;
+		}
+		if (shot) {
+			if (head >= (unsigned)shot_after * 128u) {
+				scope_draw(&st, mhz, ch, tone, from, tail, span_i, 0, head / (t - t_start), 0);
+				result = write_image(shot) != 0;
+				break;
+			}
+			usleep(10000);
+			continue;
+		}
+		if (audio_on && tail != from) { /* the tone follows the newest reading */
+			float nn = (scope_ring[(tail - 1) & (SCOPE_RING - 1)].db10 / 10.0f - low()) / DB_SPAN;
+			audio_norm = nn < 0 ? 0 : nn > 1 ? 1 : nn;
+		}
+		scope_draw(&st, mhz, ch, tone, from, tail, span_i, hold, rate, recf != NULL);
+		present();
+		while (!back && !quit && (code = next_key()) >= 0) {
+			int key = code & ~KEY_SHIFTED, shifted = code & KEY_SHIFTED;
+			switch (key) {
+			case KEY_LEFT:
+			case KEY_RIGHT:
+				if (shifted) { /* SELECT + Left / Right: time span */
+					if (key == KEY_LEFT && span_i > 0) span_i--;
+					if (key == KEY_RIGHT && span_i < SCOPE_SPANS - 1) span_i++;
+					break;
+				}
+				mhz = scope_plan(mhz + (key == KEY_RIGHT ? SCOPE_TONE_MHZ : -SCOPE_TONE_MHZ), &ch, &tone);
+				__atomic_store_n(&scope_tone, tone, __ATOMIC_RELAXED);
+				__atomic_store_n(&scope_ch, ch, __ATOMIC_RELAXED);
+				memset(&st, 0, sizeof(st)); /* another frequency: learn it afresh */
+				from = tail = __atomic_load_n(&scope_head, __ATOMIC_ACQUIRE);
+				if (recf)
+					fprintf(recf, "# frequency %.4f MHz (ch %d, tone %d of 128)\n", mhz, ch, tone);
+				break;
+			case KEY_UP: db_low += 3; break;
+			case KEY_DOWN: db_low -= 3; break;
+			case KEY_E: /* L1 */
+			case KEY_T: /* R1 */
+				if (key == KEY_E ? igi > 0x1c : igi < 0x6e)
+					igi += key == KEY_E ? -2 : 2;
+				__atomic_store_n(&scope_gain, igi, __ATOMIC_RELAXED);
+				break;
+			case KEY_SPACE: /* A: hold; SELECT + A: palette */
+				if (shifted)
+					sel_layer(KEY_SPACE);
+				else
+					hold = !hold;
+				break;
+			case KEY_LEFTSHIFT: /* X: record; SELECT + X: sound */
+				if (shifted) {
+					sel_layer(KEY_LEFTSHIFT);
+				} else if (recf) {
+					fclose(recf);
+					recf = NULL;
+					sync();
+					status("recording saved");
+				} else if ((recf = scope_rec_open(rec_path, sizeof(rec_path), mhz, ch, tone)) != NULL) {
+					snprintf(m, sizeof(m), "recording to %s", rec_path);
+					status(m);
+				} else {
+					status("cannot open recording file");
+				}
+				break;
+			case KEY_LEFTCTRL: /* B: clear */
+				memset(&st, 0, sizeof(st));
+				status("bursts cleared");
+				break;
+			case KEY_ENTER: save_screenshot(); break;
+			case KEY_TAB: back = 1; break; /* L2 */
+			case KEY_ESC: quit = 1; break;
+			}
+		}
+		if (!back && !quit)
+			wait_input(hold ? 0.25 : 1.0 / 30);
+	}
+	__atomic_store_n(&scope_run, 0, __ATOMIC_RELAXED);
+	pthread_join(reader, NULL);
+	if (recf) {
+		fclose(recf);
+		sync();
+	}
+	scope_samples = (long)tail;
+	scope_seconds = now_s() - t_start;
+	fprintf(stderr, "scope: %ld readings in %.1f s (%.0f/s) at %.4f MHz, %ld bursts\n", scope_samples,
+	        scope_seconds, scope_samples / (scope_seconds > 0 ? scope_seconds : 1), mhz, st.bursts);
+	if (!shot)
+		set_view_zoom(mhz, 3);
+	return result;
 }
 
 /* ----------------------------------------------------------- review mode */
@@ -2747,12 +3321,188 @@ done:
 	return result;
 }
 
-/* The recording browser: spectrum CSVs and packet captures from rec/ and
- * research/, newest first. */
+
+/* a scope recording, made with X in the scope? */
+static int is_scope_recording(const char *path)
+{
+	char line[128];
+	FILE *f = fopen(path, "r");
+	int yes = 0;
+	if (f) {
+		yes = fgets(line, sizeof(line), f) != NULL && strstr(line, "scope recording") != NULL;
+		fclose(f);
+	}
+	return yes;
+}
+
+static unsigned scope_count_until(unsigned n, double pos) /* readings with t <= pos */
+{
+	unsigned lo = 0, hi = n;
+	while (lo < hi) {
+		unsigned mid = lo + (hi - lo) / 2;
+		if (scope_ring[mid].t <= pos) lo = mid + 1;
+		else hi = mid;
+	}
+	return lo;
+}
+
+/* Scope recordings play on the scope's own screen: the rolling trace ends at
+ * the playback time, and the burst panel shows the last burst before it. Up to
+ * SCOPE_RING readings (about 40 s) are kept. */
+static int scope_replay(const char *path, const char *shot, double start)
+{
+	static struct scope_state st;
+	static char line[256];
+	static float first[1001];
+	const char *name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+	double mhz = 0, pos, last, speed = 1, duration, t0 = 0;
+	unsigned n = 0, fed = 0, to, drawn = ~0u, k, j;
+	int ch = 0, tone = 0, playing = !shot, back = 0, result = 0, span_i = 4, cut = 0, code, dirty = 1;
+	int status_was = 0;
+	float save_low = db_low;
+	FILE *f;
+	if (!shot)
+		loading_screen(path);
+	if ((f = fopen(path, "r")) == NULL) {
+		status("cannot open the recording");
+		return 1;
+	}
+	while (fgets(line, sizeof(line), f)) {
+		char *p, *end;
+		double t;
+		long gain, db10;
+		if (line[0] == '#') {
+			if (!n && (p = strstr(line, "recording: ")) != NULL)
+				sscanf(p + 11, "%lf MHz (ch %d, tone %d", &mhz, &ch, &tone);
+			continue;
+		}
+		if (n == SCOPE_RING) {
+			cut = 1;
+			break;
+		}
+		t = strtod(line, &end);
+		if (end == line || *end != ',' || !isfinite(t))
+			continue; /* torn or foreign row */
+		gain = strtol(end + 1, &p, 10);
+		if (*p != ',')
+			continue;
+		db10 = strtol(p + 1, NULL, 10);
+		if (!n)
+			t0 = t;
+		t -= t0;
+		if (n && t < scope_ring[n - 1].t) /* never backwards */
+			t = scope_ring[n - 1].t;
+		scope_ring[n].t = t;
+		scope_ring[n].gain = (uint8_t)(gain < 0 ? 0 : gain > 255 ? 255 : gain);
+		scope_ring[n].db10 = (int16_t)(db10 < -32768 ? -32768 : db10 > 32767 ? 32767 : db10);
+		n++;
+	}
+	fclose(f);
+	if (n < 2) {
+		fprintf(stderr, "scope replay: too few readings in %s\n", path);
+		status("scope recording too short");
+		return 1;
+	}
+	duration = scope_ring[n - 1].t;
+	fprintf(stderr, "scope replay: %u readings, %.3f s at %.4f MHz%s\n", n, duration, mhz, cut ? " (cut short)" : "");
+	for (k = 0; k < n && k < 1001; k++) { /* levels: the median of the first readings, as autoscale */
+		float v = scope_ring[k].db10 / 10.0f;
+		for (j = k; j > 0 && first[j - 1] > v; j--)
+			first[j] = first[j - 1];
+		first[j] = v;
+	}
+	db_low = floorf(first[k / 2] / 3.0f) * 3.0f - 6.0f;
+	memset(&st, 0, sizeof(st));
+	pos = start < duration ? start : duration;
+	if (!shot)
+		while (next_key() >= 0) /* presses made while it loaded */
+			;
+	last = now_s();
+	while (!quit && !back) {
+		double t = now_s();
+		int status_now = status_until > t;
+		if (playing) {
+			pos += (t - last) * speed;
+			if (pos >= duration) {
+				pos = duration;
+				playing = 0;
+				dirty = 1;
+			}
+		}
+		last = t;
+		to = scope_count_until(n, pos);
+		if (to < fed) { /* back in time: analyse again from the start */
+			memset(&st, 0, sizeof(st));
+			fed = 0;
+		}
+		for (; fed < to; fed++)
+			scope_feed(&st, (long)fed, scope_ring[fed].t, scope_ring[fed].db10 / 10.0f);
+		if (to != drawn || status_now != status_was)
+			dirty = 1;
+		status_was = status_now;
+		if (dirty) {
+			char s[200];
+			scope_draw(&st, mhz, ch, tone, 0, to, span_i, 0, n / (duration > 0 ? duration : 1), 0);
+			fill(0, 0, SW, 18, C_BG);
+			snprintf(s, sizeof(s), "SCOPE REPLAY  %.32s   %.2f / %.2f s   x%g   %s%s", name, pos, duration, speed,
+			         playing ? "PLAY" : pos >= duration ? "END" : "PAUSE", cut ? "  CUT SHORT" : "");
+			text(4, 2, C_TEXT, s);
+			fill(0, SH - 18, SW, 18, C_BG);
+			if (status_now)
+				text(4, SH - 17, C_HOLD, status_msg);
+			else
+				text(4, SH - 17, C_DIM, "A play  L/R seek  SEL+L/R time  L1/R1 speed  Up/Dn range  START png  B back");
+			if (shot) {
+				result = write_image(shot) != 0;
+				break;
+			}
+			present();
+			drawn = to;
+			dirty = 0;
+		}
+		while (!back && !quit && (code = next_key()) >= 0) {
+			int key = code & ~KEY_SHIFTED, shifted = code & KEY_SHIFTED;
+			dirty = 1;
+			switch (key) {
+			case KEY_SPACE:
+				if (!playing && pos >= duration)
+					pos = 0;
+				playing = !playing;
+				break;
+			case KEY_LEFT:
+			case KEY_RIGHT:
+				if (shifted) { /* SELECT + Left / Right: time span */
+					if (key == KEY_LEFT && span_i > 0) span_i--;
+					if (key == KEY_RIGHT && span_i < SCOPE_SPANS - 1) span_i++;
+				} else { /* seek a quarter of the trace */
+					pos += (key == KEY_RIGHT ? 1 : -1) * scope_spans[span_i] / 4;
+					pos = pos < 0 ? 0 : pos > duration ? duration : pos;
+				}
+				break;
+			case KEY_UP: db_low += 3; break;
+			case KEY_DOWN: db_low -= 3; break;
+			case KEY_E: if (speed > 0.25) speed /= 2; break;
+			case KEY_T: if (speed < 8) speed *= 2; break;
+			case KEY_ENTER: save_screenshot(); break;
+			case KEY_LEFTCTRL: back = 1; break;
+			case KEY_ESC: quit = 1; break;
+			}
+		}
+		if (!dirty && !back && !quit)
+			wait_input(playing ? 1.0 / 30 : status_now ? status_until - now_s() + 0.01 : 0.5);
+	}
+	db_low = save_low;
+	return result;
+}
+
+/* The recording browser: spectrum CSVs, scope recordings and packet captures
+ * from rec/ and research/, newest first. */
+enum { REC_SPECTRUM, REC_PCAP, REC_SCOPE };
+
 struct rec_entry {
 	char path[300];
 	time_t mtime;
-	int packet;
+	int kind;
 };
 
 static int has_suffix(const char *s, const char *suffix)
@@ -2783,8 +3533,8 @@ static size_t list_recordings(struct rec_entry **out)
 		while ((e = readdir(dir)) != NULL) {
 			struct stat st;
 			struct rec_entry *it;
-			int packet = has_suffix(e->d_name, ".pcap");
-			if (!packet && !has_suffix(e->d_name, ".csv"))
+			int kind = has_suffix(e->d_name, ".pcap") ? REC_PCAP : REC_SPECTRUM;
+			if (kind != REC_PCAP && !has_suffix(e->d_name, ".csv"))
 				continue;
 			if (n == cap) {
 				struct rec_entry *grown = realloc(list, (cap ? cap * 2 : 64) * sizeof(*list));
@@ -2795,7 +3545,7 @@ static size_t list_recordings(struct rec_entry **out)
 			}
 			it = &list[n++];
 			snprintf(it->path, sizeof(it->path), "%s/%s", dirs[d], e->d_name);
-			it->packet = packet;
+			it->kind = kind == REC_SPECTRUM && is_scope_recording(it->path) ? REC_SCOPE : kind;
 			it->mtime = stat(it->path, &st) == 0 ? st.st_mtime : 0;
 		}
 		closedir(dir);
@@ -2837,7 +3587,8 @@ static void review_session(void)
 				int y = 30 + (int)(i - first) * 18;
 				if (i == sel)
 					text(8, y, C_LIVE, ">");
-				snprintf(label, sizeof(label), "[%s] %.68s", list[i].packet ? "PCAP" : "CSV ", list[i].path);
+				snprintf(label, sizeof(label), "[%s] %.68s",
+				         list[i].kind == REC_PCAP ? "PCAP" : list[i].kind == REC_SCOPE ? "SCOP" : "CSV ", list[i].path);
 				text(24, y, i == sel ? C_LIVE : C_DIM, label);
 			}
 			if (status_now)
@@ -2859,8 +3610,10 @@ static void review_session(void)
 			}
 		}
 		if (chosen >= 0) {
-			if (list[chosen].packet)
+			if (list[chosen].kind == REC_PCAP)
 				packet_review(list[chosen].path, NULL, 0);
+			else if (list[chosen].kind == REC_SCOPE)
+				scope_replay(list[chosen].path, NULL, 0);
 			else
 				review_play(list[chosen].path, NULL, 0);
 			dirty = 1;
@@ -2875,7 +3628,8 @@ static void review_session(void)
 	free(list);
 }
 
-/* Playback and browsing need no radio: --replay FILE (.pcap or .csv) and --review.
+/* Playback and browsing need no radio: --replay FILE (.pcap, or a spectrum or scope
+ * .csv) and --review.
  * B in a replay opened with --replay goes to the browser, as it does elsewhere. */
 static int run_offline(const char *replay_path, const char *shot, double replay_at)
 {
@@ -2883,8 +3637,12 @@ static int run_offline(const char *replay_path, const char *shot, double replay_
 	make_lut();
 	view_full();
 	if (replay_path) {
-		result = has_suffix(replay_path, ".csv") ? review_play(replay_path, shot, replay_at)
-		                                         : packet_review(replay_path, shot, replay_at);
+		if (!has_suffix(replay_path, ".csv"))
+			result = packet_review(replay_path, shot, replay_at);
+		else if (is_scope_recording(replay_path))
+			result = scope_replay(replay_path, shot, replay_at);
+		else
+			result = review_play(replay_path, shot, replay_at);
 		if (shot || quit || result)
 			return result;
 	}
@@ -2913,8 +3671,9 @@ static void usage(FILE *out)
 	        "  --shot FILE           render one frame to FILE (.png or .ppm) and exit\n"
 	        "  --shot-after N        live sweeps before --shot renders (default 12)\n"
 	        "  --zoom MHZ LEVEL      start zoomed: level 1, 2, 3 = 20, 10, 5 MHz\n"
+	        "  --scope MHZ           start on the scope: one frequency read over and over\n"
 	        "  --style N  --pal N    spectrum style 0-2, palette 0-%d\n"
-	        "  --occ                 start on the channel occupancy panel\n"
+	        "  --panel N  --occ      lower panel 0 waterfall, 1 occupancy, 2 persistence\n"
 	        "  --dump N              N sweeps as text\n"
 	        "  --burst MHZ SECONDS   single-channel power-vs-time recording\n"
 	        "  --probe  --racap      PSD timing and raw-capture probes\n"
@@ -2954,8 +3713,8 @@ int main(int argc, char **argv)
 	const char *shot = NULL, *replay_path = NULL, *bad = NULL;
 	int review_only = 0, replay_at_set = 0, pm_only = 0, needs_radio = 0, version = 0, shot_failed = 0;
 	double replay_at = 0;
-	int dump = 0, probe = 0, racap = 0, burst_sec = 0, i, shot_after = 12, zlevel = 0, use_settings = argc == 1;
-	double t0, last_rate_t, last_flush, last_diag = 0, zf = 0, burst_mhz = 0;
+	int dump = 0, probe = 0, racap = 0, burst_sec = 0, i, zlevel = 0, use_settings = argc == 1;
+	double t0, last_rate_t, last_flush, last_diag = 0, zf = 0, burst_mhz = 0, scope_mhz = 0;
 	long last_sweeps = 0;
 	struct sigaction sa;
 
@@ -2985,10 +3744,14 @@ int main(int argc, char **argv)
 		else if (!strcmp(a, "--shot-after")) { if (left < 1 || arg_int(argv[++i], 1, 1000000, &shot_after)) bad = a; }
 		else if (!strcmp(a, "--style")) { if (left < 1 || arg_int(argv[++i], 0, 2, &spec_style)) bad = a; }
 		else if (!strcmp(a, "--pal")) { if (left < 1 || arg_int(argv[++i], 0, NPAL - 1, &palette)) bad = a; }
+		else if (!strcmp(a, "--panel")) { if (left < 1 || arg_int(argv[++i], 0, 2, &disp_mode)) bad = a; }
 		else if (!strcmp(a, "--zoom")) {
 			if (left < 2 || arg_num(argv[i + 1], BAND_LO, BAND_HI, &zf) || arg_int(argv[i + 2], 1, 3, &zlevel))
 				bad = a;
 			i += 2;
+		} else if (!strcmp(a, "--scope")) {
+			if (left < 1 || arg_num(argv[++i], BAND_LO, BAND_HI, &scope_mhz))
+				bad = a;
 		} else if (!strcmp(a, "--burst")) {
 			if (left < 2 || arg_num(argv[i + 1], BAND_LO, BAND_HI, &burst_mhz) ||
 			    arg_int(argv[i + 2], 1, 86400, &burst_sec))
@@ -3174,12 +3937,20 @@ int main(int argc, char **argv)
 		return 3;
 	}
 
+	if (scope_mhz > 0) /* --scope: one frequency first; L2 goes on to the live zoom */
+		shot_failed = scope_session(scope_mhz, shot);
 	t0 = last_rate_t = last_flush = now_s();
-	while (!quit) {
+	while (!quit && !(scope_mhz > 0 && shot)) {
 		int fresh = do_sweep(); /* 0: a button changed the view mid-sweep */
 		if (review_request) { /* SELECT+START: browse and replay recordings */
 			review_request = 0;
 			review_session();
+			last_rate_t = last_flush = last_diag = now_s();
+			continue;
+		}
+		if (scope_request) { /* R2 at the 5 MHz zoom: one frequency over time */
+			scope_request = 0;
+			scope_session(scope_request_mhz, NULL);
 			last_rate_t = last_flush = last_diag = now_s();
 			continue;
 		}

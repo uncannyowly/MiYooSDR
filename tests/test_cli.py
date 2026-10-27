@@ -156,6 +156,24 @@ class CliTests(unittest.TestCase):
                     colours.add(pixel)
         self.assertEqual(colours, {C_MGMT})
 
+    def test_scope_option_is_checked_and_needs_the_radio(self):
+        self.assertEqual(self.run_app("--fake", "--scope", "3000", "--shot", "x.png").returncode, 2)
+        self.assertEqual(self.run_app("--needs-radio", "--scope", "2426").returncode, 0)
+        result = self.run_app("--fake", "--scope", "2447.3", "--shot", "scope.png")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        width, height, _ = read_png(self.path / "scope.png")
+        self.assertEqual((width, height), (640, 480))
+
+    def test_scope_recording_replays_headless(self):
+        path = self.path / "scope.csv"
+        rows = [f"{n / 3000:.5f},40,{700 if 3000 <= n < 3003 else 450}" for n in range(6000)]
+        path.write_text("# MiYooSDR scope recording: 2402.1875 MHz (ch 1, tone -31 of 128, 0.3125 MHz wide)\n"
+                        "# columns: seconds, gain(IGI), dB*10 (uncalibrated)\n" + "\n".join(rows) + "\n")
+        result = self.run_app("--replay", path, "--replay-at", "1.5", "--shot", "scope.png")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("scope replay: 6000 readings", result.stderr)
+        self.assertEqual(read_png(self.path / "scope.png")[:2], (640, 480))
+
     def test_csv_recording_replays_headless(self):
         rows = [[40 + (i % 7) for i in range(256)] for _ in range(6)]
         rows[5][100] = 90

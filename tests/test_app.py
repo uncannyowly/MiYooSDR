@@ -21,6 +21,18 @@ SAFE_ENV = dict(os.environ, MIYOOSDR_FB="/nonexistent/fb", MIYOOSDR_INPUT="/none
 REVIEW_LIMIT = 4096  # readings the harness's CSV review keeps, so truncation is cheap to reach
 
 
+def scope_csv():
+    """A scope recording: 3000 readings a second, 1 s of 45 dB, then 10 hits of 1 ms at
+    70 dB 20 ms apart, then quiet; as the scope's X button writes it."""
+    lines = ["# MiYooSDR scope recording: 2402.1875 MHz (ch 1, tone -31 of 128, 0.3125 MHz wide)",
+             "# columns: seconds, gain(IGI), dB*10 (uncalibrated)"]
+    for n in range(3 * 3000):
+        t = n / 3000
+        hit = 1.0 <= t < 1.2 and (t - 1.0) % 0.020 < 0.001 - 1e-9
+        lines.append(f"{t:.5f},40,{700 if hit else 450}")
+    return "\n".join(lines) + "\n"
+
+
 def burst(channel, rows):
     f0 = 2407 + 5 * channel - 64 * 0.3125
     lines = [f"# MiYooSDR burst capture: channel {channel}, bin i = {f0:.4f} + 0.3125*i MHz, 128 bins, 128-pt FFT",
@@ -162,6 +174,76 @@ class AppTests(unittest.TestCase):
         path = self.path / "long.csv"
         path.write_text(recording([(1, 2430.0, 0.15625, 5, rows)]))
         self.assertIn(f"rows {REVIEW_LIMIT // 128} truncated 1", self.harness("csv-load", path))
+
+    def test_persistence_builds_up_where_a_level_recurs_and_fades(self):
+        out = self.harness("persist")
+        row, rows = map(int, re.search(r"peak row (\d+) of (\d+)", out).groups())
+        # 70 dB sits 30 dB above the 40 dB bottom of a 48 dB range: 62.5% of the way up.
+        self.assertAlmostEqual(row / (rows - 1), 30 / 48, delta=0.03)
+        self.assertLess(int(re.search(r"decayed (\d+)%", out).group(1)), 10)
+        self.assertIn("after range change 0", out)
+
+    def test_persistence_panel_is_drawn(self):
+        self.assertIn("title 1", self.harness("persist-panel"))
+
+    def test_select_b_cycles_three_lower_panels(self):
+        self.assertEqual(self.harness("panels").split(), ["1", "2", "0"])
+
+    def test_settings_remember_the_persistence_panel(self):
+        (self.path / "settings.txt").write_text("panel=2\n")
+        self.assertIn("panel 2", self.harness("settings-panel", self.path))
+
+    def test_scope_measures_burst_timing(self):
+        out = self.harness("scope-feed")
+        bursts, hits, gap, length, interval = re.search(
+            r"bursts (\d+) hits (\d+) gap ([\d.]+) len ([\d.]+) interval ([\d.]+)", out).groups()
+        self.assertEqual((int(bursts), int(hits)), (2, 10))
+        self.assertAlmostEqual(float(gap), 20.0, delta=0.4)        # ms between hit starts
+        self.assertAlmostEqual(float(length), 181.0, delta=0.7)    # first hit start to last hit end
+        self.assertAlmostEqual(float(interval), 1.3, delta=0.002)  # s between burst starts
+
+    def test_scope_trace_holds_each_reading_until_the_next(self):
+        covered, span = map(int, re.search(r"covered (\d+) of (\d+)", self.harness("scope-sparse")).groups())
+        self.assertGreater(span, 400)  # the readings stretch across the panel
+        self.assertEqual(covered, span)  # and every column between them is drawn
+
+    def test_r2_at_the_narrowest_zoom_opens_the_scope_at_the_cursor(self):
+        request, mhz = re.search(r"scope request (\d) at ([\d.]+)", self.harness("scope-enter")).groups()
+        self.assertEqual(request, "1")
+        self.assertAlmostEqual(float(mhz), 2440.0, delta=0.04)
+
+    def test_scope_reads_continuously_and_returns_to_the_zoom(self):
+        samples, rate, level, mhz = re.search(r"samples (\d+) rate (\d+) level (\d) cursor ([\d.]+)",
+                                              self.harness("scope-run")).groups()
+        self.assertGreater(int(rate), 1000)
+        self.assertEqual(level, "3")
+        self.assertAlmostEqual(float(mhz), 2447.3, delta=0.04)
+
+    def test_scope_recording_writes_timed_readings(self):
+        self.harness("scope-rec", self.path)
+        files = list((self.path / "rec").glob("scope-*.csv"))
+        self.assertEqual(len(files), 1)
+        lines = files[0].read_text().splitlines()
+        header = [l for l in lines if l.startswith("#")]
+        rows = [l.split(",") for l in lines if not l.startswith("#")]
+        self.assertIn("scope recording", header[0])
+        self.assertIn("2447.3", header[0])
+        self.assertGreater(len(rows), 200)
+        self.assertTrue(all(len(r) == 3 for r in rows))
+        times = [float(r[0]) for r in rows]
+        self.assertEqual(times, sorted(times))
+
+    def test_browser_marks_scope_recordings(self):
+        (self.path / "rec").mkdir()
+        (self.path / "rec/scope-1.csv").write_text(scope_csv())
+        (self.path / "rec/sdr-1.csv").write_text("0.000,40,0,400\n")
+        self.assertEqual(sorted(self.harness("list", self.path).split("\n")[:2]),
+                         ["C rec/sdr-1.csv", "S rec/scope-1.csv"])
+
+    def test_scope_replay_measures_the_recorded_burst(self):
+        path = self.path / "scope.csv"
+        path.write_text(scope_csv())
+        self.assertIn("burst 1 hits 1 gap 1", self.harness("scope-replay", path, 2.0))
 
     def test_csv_review_draws_its_own_footer(self):
         path = self.path / "footer.csv"

@@ -23,7 +23,7 @@ build/miyoo/miyoo-pcap: tools/miyoo-pcap.c
 
 build/host/miyoosdr: $(APP_DEPS)
 	mkdir -p $(dir $@)
-	cc $(APP_CFLAGS) -o $@ $(APP_SRC) -lm
+	cc $(APP_CFLAGS) -o $@ $(APP_SRC) -lm -lpthread
 
 build/miyoo/miyoosdr: $(APP_DEPS)
 	mkdir -p $(dir $@)
