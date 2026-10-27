@@ -114,14 +114,16 @@ The capture utility can also be invoked directly on the device:
 ```
 
 Use the detached wrapper over Wi-Fi SSH so recovery is scheduled before changing
-the mode. There is no channel hopping or transmit/injection operation in this
+the mode. The wrapper stops before touching Wi-Fi if `miyoo-pcap` is missing, and
+its restore brings Wi-Fi back even when `wlan0` never left managed mode. There is no channel hopping or transmit/injection operation in this
 utility. Returning to managed operation resumes normal Wi-Fi transmissions.
 
 ## Playback on the Miyoo
 
-MiYooSDR 0.5.0 adds offline PCAP playback alongside existing spectrum CSV review.
-The **SELECT + START** browser lists `.pcap` and `.csv` files from `rec/` and
-`research/`, relative to the application directory. The capture script's default
+MiYooSDR plays PCAPs alongside spectrum CSV recordings (since 0.5.0). The
+recording browser, opened by the **MiYooSDR Replay** app or **SELECT + START**,
+lists `.pcap` and `.csv` files from `rec/` and `research/`, relative to the
+application directory, newest first. The capture script's default
 `research/stock-monitor.pcap` therefore appears without moving the file.
 
 The PCAP view follows capture timestamps, shows packet counts over time and a
@@ -132,7 +134,8 @@ Down seek by a second. B returns to the browser, MENU quits, and START saves a
 screenshot. Playback stops at the end; A restarts it.
 
 To start directly in offline review, preserving the active Wi-Fi connection and
-skipping the launcher's audio teardown:
+skipping the launcher's audio teardown (Onion's menu is paused while the replay
+has the screen, and comes back as it was):
 
 ```sh
 cd /mnt/SDCARD/App/MiYooSDR
@@ -146,7 +149,8 @@ protected payloads, reconstructing spectrum or I/Q samples, or transmitting
 frames. The driver's metadata limitations below still apply during playback.
 The separate capture utility and detached recovery script are unchanged.
 
-For a repeatable host rendering at 2.5 seconds after the first packet:
+For a repeatable host rendering at 2.5 seconds after the first packet (the PC and
+the Miyoo produce identical files):
 
 ```sh
 make host

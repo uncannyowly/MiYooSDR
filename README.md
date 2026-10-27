@@ -6,14 +6,14 @@ No external receiver is needed for the supported live measurements and captures.
 
 ## Current state
 
-The current published version is **[0.5.0 (experimental)](https://github.com/uncannyowly/MiYooSDR/releases/tag/v0.5.0)**.
+The current published version is **[0.6.0 (experimental)](https://github.com/uncannyowly/MiYooSDR/releases/tag/v0.6.0)**.
 There are three separate workflows:
 
 | Workflow | Available now | How to use it |
 | --- | --- | --- |
 | Live spectrum view | Sequential PSD power measurements, waterfall, zoom, relative channel-activity bars, audio tone, CSV recording and review | Launch MiYooSDR from Onion's Apps list |
 | Wi-Fi packet capture | 802.11 frames with driver-provided radiotap metadata, saved as PCAP using the stock driver | Run the separate `research/monitor-capture.sh` script over SSH |
-| Saved packet playback | Packet-count timeline, frame list, header fields and available PHY metadata | Open a PCAP through SELECT + START, or use `--replay` |
+| Saved playback | PCAPs: packet-count timeline, frame list, header fields and available PHY metadata. Spectrum CSVs: spectrum and waterfall replay | The **MiYooSDR Replay** app, SELECT + START in live mode, or `--replay` |
 
 Spectrum recording with **X** saves power measurements as CSV. It does not start
 packet capture. The recording browser opens saved files; there is currently no
@@ -38,8 +38,14 @@ On one Miyoo Mini Plus running OnionOS, Linux **4.9.84**, and stock driver
   frame was received. Managed Wi-Fi recovered after that experiment.
 - Offline playback loaded that capture and rendered a screenshot on the Miyoo
   that matched the host rendering byte for byte, while Wi-Fi stayed connected.
+- Version 0.6.0 on the same Mini Plus: live sweeps through full band, zoom and
+  back with no I/O errors or frozen readings, at about 5 sweeps per second full
+  band and 15 at the 20 MHz zoom. A replay started over SSH paused Onion's menu,
+  took the buttons, and handed both back with the screen restored byte for byte.
+  PCAP and spectrum CSV replay screenshots matched the host renders byte for byte.
 - Automated tests cover PCAP parsing, malformed files, record limits, offline
-  rendering, and launcher behavior. Hardware validation does not yet cover every
+  rendering, CSV recordings, sweep and input handling, and the launcher and
+  capture-script behavior. Hardware validation does not yet cover every
   interactive control or other driver/OS versions.
 
 The stock driver can report incorrect rates and suspect signal values. No
@@ -61,14 +67,21 @@ the [research notes](docs/driver-research.md) for the evidence and limitations.
 ## Install
 
 1. Download `miyoosdr-<version>.zip` from [Releases](https://github.com/uncannyowly/MiYooSDR/releases).
-2. Extract it to the root of your SD card. It drops in as `App/MiYooSDR`.
-3. On the Mini Plus, open it from Onion's **Apps** list.
+2. Extract it to the root of your SD card. It drops in as `App/MiYooSDR` and
+   `App/MiYooSDR Replay`.
+3. On the Mini Plus, open **MiYooSDR** from Onion's **Apps** list for the live
+   spectrum, or **MiYooSDR Replay** to play saved recordings and captures.
 
 Live spectrum mode takes Wi-Fi offline so nothing retunes the radio mid-sweep.
-On exit, the launcher attempts to restore Onion's networking. Opening a capture
-directly with `launch.sh --replay`, or the browser with `launch.sh --review`, skips
-radio setup and the launcher's Wi-Fi and audio teardown. Opening review from a
-running live-spectrum session keeps that session's Wi-Fi-off state until exit.
+On exit, the launcher attempts to restore Onion's networking. MiYooSDR Replay,
+`launch.sh --replay FILE` and `launch.sh --review` leave Wi-Fi and audio alone:
+the launcher asks the app whether its options need the radio, and refuses
+mistyped options before anything changes. Opening review from a running
+live-spectrum session keeps that session's Wi-Fi-off state until exit.
+
+Started over SSH while Onion's menu is on screen, MiYooSDR pauses the menu and
+takes the buttons for itself, then hands both back on exit with the screen as it
+was.
 
 The ZIP includes both binaries, scripts, and documentation. It contains no sample
 recordings or captured network traffic. Create a capture or copy in a compatible
@@ -96,10 +109,14 @@ when extracting the ZIP over an installed copy.
 | START | Save a screenshot (`App/MiYooSDR/shots/sdr-<date>-<time>.png`) |
 | MENU | Quit |
 
+Holding a button repeats only on the d-pad and L1 / R1, so toggles such as X and A
+act once per press. Screenshots are compressed PNGs of about 25 to 55 KB.
+
 Levels are **uncalibrated** relative dB, not measured dBm. The nominal full-band
 view covers roughly 2402 to 2482 MHz in 256 bins. Zoomed views use larger on-chip
-FFTs on a single channel, down to about 39 kHz nominal bin spacing. This is not a
-calibrated frequency-resolution or receiver-sensitivity specification.
+FFTs on a single channel, down to about 39 kHz nominal bin spacing. Each bin is
+labelled with the centre frequency of its FFT tone. This is not a calibrated
+frequency-resolution or receiver-sensitivity specification.
 
 ## Reading the screen
 
@@ -126,11 +143,12 @@ calibrated frequency-resolution or receiver-sensitivity specification.
 
 ## Playing back captures
 
-Press **SELECT + START** to open the recording browser. It lists `.csv` and
-`.pcap` files from `App/MiYooSDR/rec/` and `App/MiYooSDR/research/`, including the
+Open the recording browser with the **MiYooSDR Replay** app, or with
+**SELECT + START** during live spectrum. It lists `.csv` and `.pcap` files from
+`App/MiYooSDR/rec/` and `App/MiYooSDR/research/`, newest first, including the
 `research/stock-monitor.pcap` produced by the packet capture script. Copy other
-compatible captures into either directory. Use Up / Down to select a file, A to
-open it, and B to return.
+compatible captures into either directory. Use Up / Down to select a file, Left /
+Right to page, A to open it, and B to return.
 
 PCAP playback shows management/control/data frame counts over time, a scrolling
 frame list, and the selected frame's type, transmitter/receiver addresses,
@@ -145,11 +163,26 @@ tool records Linux delivery timestamps, not hardware RF arrival timestamps.
 | L1 / R1 | Slow down / speed up (0.25× to 8×) |
 | Up / Down | Seek by one second |
 | START | Save a screenshot |
+| B | Return to the recording browser (also after `--replay`) |
+| MENU | Quit |
+
+Spectrum recordings (`.csv`) replay as spectrum and waterfall. A recording that
+zoomed or panned partway plays each part on its own frequency axis, and the
+waterfall shows the rows recorded up to the current moment, so it holds still
+while paused. With signal-to-sound on, the tone follows the recording.
+
+| Button during CSV playback | Action |
+| --- | --- |
+| A | Pause / play; restart after the end |
+| Left / Right | Pause and step one row backward / forward |
+| L1 / R1 | Slow down / speed up (0.25× to 8×) |
+| Up / Down | Shift the level range |
+| Y | Enhance |
+| START | Save a screenshot |
 | B | Return to the recording browser |
 | MENU | Quit |
 
-Spectrum CSV review remains available in the same browser. The packet viewer
-keeps header metadata and discards payloads while loading; it does not provide
+The packet viewer keeps header metadata and discards payloads while loading; it does not provide
 payload inspection or decryption. PCAP playback cannot reconstruct spectrum power
 bins, a waveform, or a waterfall. It displays driver-supplied bad-FCS flags but
 does not independently check frame checksums. The separate host inspection tool
@@ -159,8 +192,9 @@ Supported PCAP files use classic PCAP with radiotap link type 127, microsecond o
 nanosecond timestamps, and either byte order. Loading stops after the first
 100,000 on-disk records, including skipped records, and indicates if the file was
 limited. Unsupported or malformed individual frame headers are skipped; invalid
-or truncated PCAP containers fail with an error. Backward timestamps are clamped
-to keep playback time nondecreasing. PCAPNG and other link types are unsupported.
+or truncated PCAP containers fail with an error. A small step back in time holds
+the playback clock; a jump back of more than a second counts as a capture-clock
+reset, and later frames keep their spacing. PCAPNG and other link types are unsupported.
 In Wireshark, choose the `pcap` format when exporting a radiotap capture.
 
 To open a PCAP directly on the Miyoo without starting live radio capture:
@@ -177,12 +211,14 @@ make host
 build/host/miyoosdr --replay capture.pcap --replay-at 2.5 --shot packet-review.png
 ```
 
-`--replay-at` selects seconds from the first supported packet. Direct PCAP playback
-reads the file without accessing the Wi-Fi radio.
+`--replay` plays spectrum CSV recordings the same way. `--replay-at` selects
+seconds from the first supported packet or recording row. Direct playback reads the
+file without accessing the Wi-Fi radio.
 
 Use `./launch.sh --review` to open the recording browser directly without starting
 live radio capture. Interactive host playback requires `/dev/fb0` and
-`/dev/input/event0`; a normal desktop window is not implemented.
+`/dev/input/event0` (`MIYOOSDR_FB` and `MIYOOSDR_INPUT` override the paths); a
+normal desktop window is not implemented.
 
 ## Recording spectrum measurements
 
@@ -270,7 +306,7 @@ With the SDK's `usr/bin` directory on your `PATH`:
 
 ```sh
 make miyoo
-python3 tools/package.py 0.5.0
+python3 tools/package.py        # version from the VERSION file
 ```
 
 The convenience wrapper below requires Docker and an **existing local image
@@ -278,10 +314,10 @@ named `gta1-miyoo-toolchain`** containing that SDK. The repository does not crea
 that image automatically:
 
 ```sh
-./build.sh          # -> both ARM binaries and dist/miyoosdr-0.5.0.zip
+./build.sh          # -> both ARM binaries and dist/miyoosdr-<VERSION>.zip
 ```
 
-Pushing a version tag such as `v0.5.0` runs the GitHub release workflow. It builds
+Pushing a version tag such as `v0.6.0` runs the GitHub release workflow. It builds
 both binaries and publishes the installation ZIP, SHA-256 checksum, and matching
 notes from `docs/releases/<version>.md` as an experimental prerelease.
 
@@ -294,7 +330,10 @@ make test
 build/host/miyoosdr --fake --shot out.png
 ```
 
-Other modes: `--dump N` (N sweeps as text), `--probe` (PSD timing), `--zoom MHZ LEVEL`,
+`make clean` removes `build/host` and `build/miyoo` but keeps `build/research`,
+where local research data lives.
+
+Other modes: `--help` (all options), `--version`, `--dump N` (N sweeps as text), `--probe` (PSD timing), `--zoom MHZ LEVEL`,
 `--shot-after N` (sweeps before `--shot` renders, default 12), `--settings` (read and
 write `settings.txt` even when started with options). Synthetic input is for UI
 development; it does not validate radio sensitivity, timing accuracy or decoding.
