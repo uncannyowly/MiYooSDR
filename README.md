@@ -6,12 +6,12 @@ No external receiver is needed for the supported live measurements and captures.
 
 ## Current state
 
-The current published version is **[0.6.0 (experimental)](https://github.com/uncannyowly/MiYooSDR/releases/tag/v0.6.0)**.
+The current published version is **[0.7.0 (experimental)](https://github.com/uncannyowly/MiYooSDR/releases/tag/v0.7.0)**.
 There are three separate workflows:
 
 | Workflow | Available now | How to use it |
 | --- | --- | --- |
-| Live spectrum view | Sequential PSD power measurements, waterfall, zoom, relative channel-activity bars, audio tone, CSV recording and review | Launch MiYooSDR from Onion's Apps list |
+| Live spectrum view | Sequential PSD power measurements, waterfall, zoom, relative channel-activity bars, persistence display, a single-frequency scope, audio tone, CSV recording and review | Launch MiYooSDR from Onion's Apps list |
 | Wi-Fi packet capture | 802.11 frames with driver-provided radiotap metadata, saved as PCAP using the stock driver | Run the separate `research/monitor-capture.sh` script over SSH |
 | Saved playback | PCAPs: packet-count timeline, frame list, header fields and available PHY metadata. Spectrum CSVs: spectrum and waterfall replay | The **MiYooSDR Replay** app, SELECT + START in live mode, or `--replay` |
 
@@ -43,6 +43,9 @@ On one Miyoo Mini Plus running OnionOS, Linux **4.9.84**, and stock driver
   band and 15 at the 20 MHz zoom. A replay started over SSH paused Onion's menu,
   took the buttons, and handed both back with the screen restored byte for byte.
   PCAP and spectrum CSV replay screenshots matched the host renders byte for byte.
+- Version 0.7.0: the scope read about 3,100 times a second at 2426 MHz (Bluetooth
+  LE advertising channel 38) and caught bursts there as short as one reading. The
+  persistence panel, scope replay and SELECT combinations worked on the device.
 - Automated tests cover PCAP parsing, malformed files, record limits, offline
   rendering, CSV recordings, sweep and input handling, and the launcher and
   capture-script behavior. Hardware validation does not yet cover every
@@ -92,12 +95,12 @@ when extracting the ZIP over an installed copy.
 
 | Button | Action |
 | --- | --- |
-| R2 / L2 | Zoom in / out (full band, then 20, 10, 5 MHz around the cursor) |
+| R2 / L2 | Zoom in / out (full band, then 20, 10, 5 MHz around the cursor); R2 at 5 MHz opens the [scope](#scope-mode) |
 | D-pad Left / Right | Move the cursor (pans the view at the edges when zoomed) |
 | SELECT (tap) | Jump the cursor to the strongest peak |
 | SELECT + Y | Cycle the spectrum view: line, filled, filled with Wi-Fi band shading |
 | SELECT + A | Cycle the colour palette (Ember, Spectrum, Ice, Matrix) |
-| SELECT + B | Switch between waterfall and relative channel-activity bars |
+| SELECT + B | Cycle the lower panel: waterfall, relative channel-activity bars, persistence |
 | SELECT + X | Signal-to-sound: a tone whose pitch follows the level under the cursor |
 | SELECT + START | Browse saved spectrum CSVs and Wi-Fi PCAPs |
 | Y | Enhance: show dB above the slow background instead of absolute level |
@@ -135,17 +138,57 @@ frequency-resolution or receiver-sensitivity specification.
   background across overlapping Wi-Fi channel windows. They update in full-band
   mode and remain unchanged while zoomed. They are not measured airtime or a
   guarantee that a suggested channel is clear.
+- **Persistence view:** how often each level has shown up at each frequency over
+  roughly the last 30 sweeps, brighter for more often. A steady carrier is a bright
+  line, a busy Wi-Fi channel a cloud above the floor, and rare hits single dots
+  that a live trace would miss. Changing the level range starts it over.
 - **Signal-to-sound:** the tone follows the relative level at the cursor. It is
   an audio aid, not a validated direction-finding or distance measurement.
 - **Remembered:** palette, view style, lower panel, enhance, max hold, zoom and the
   cursor are saved to `App/MiYooSDR/settings.txt` when you quit and restored on the
   next start. Delete the file to start fresh.
 
+## Scope mode
+
+The scope reads one frequency over and over, about 3,000 times a second, instead
+of sweeping. Sweeps come back to a frequency only every 40 to 200 ms; the scope
+shows the shape and timing of short bursts, such as a remote's button press. Open
+it with **R2 at the 5 MHz zoom** (it reads the frequency under the cursor), or start
+on it with `./launch.sh --scope 2402`.
+
+Each reading covers a 312.5 kHz wide FFT bin, the one nearest the frequency asked
+for. The upper panel is a rolling trace of the last second or so. A **hit** is a
+reading over the yellow dotted line, well above the background (blue dotted line);
+both adapt to the noise between bursts. Hits less than 50 ms apart make one
+**burst**. The lower panel shows the last burst stretched out with a millisecond
+axis, and the right column counts bursts, the time since the last one, the time
+between bursts, and the hits in the last one.
+
+| Button in the scope | Action |
+| --- | --- |
+| Left / Right | Move to the next 312.5 kHz bin down / up |
+| SELECT + Left / Right | Shorten / lengthen the trace (0.05 to 10 s) |
+| Up / Down | Shift the level range |
+| L1 / R1 | Gain down / up |
+| A | Hold the screen / run again |
+| X | Start / stop recording to `App/MiYooSDR/rec/scope-<date>-<time>.csv` |
+| B | Clear the burst count |
+| SELECT + X / SELECT + A | Signal-to-sound / palette |
+| START | Save a screenshot |
+| L2 | Back to the 5 MHz zoom |
+| MENU | Quit |
+
+Readings are about 0.3 ms apart, so a packet shorter than that can fall between
+two readings, and burst lengths and spacing are accurate to about one reading.
+Scope recordings hold one reading per line (seconds, gain, dB times ten) and play
+back in the recording browser, marked `[SCOP]`, on the scope's own screen.
+
 ## Playing back captures
 
 Open the recording browser with the **MiYooSDR Replay** app, or with
 **SELECT + START** during live spectrum. It lists `.csv` and `.pcap` files from
-`App/MiYooSDR/rec/` and `App/MiYooSDR/research/`, newest first, including the
+`App/MiYooSDR/rec/` and `App/MiYooSDR/research/`, newest first, marked `[CSV ]`,
+`[SCOP]` for scope recordings or `[PCAP]`, including the
 `research/stock-monitor.pcap` produced by the packet capture script. Copy other
 compatible captures into either directory. Use Up / Down to select a file, Left /
 Right to page, A to open it, and B to return.
@@ -317,7 +360,7 @@ that image automatically:
 ./build.sh          # -> both ARM binaries and dist/miyoosdr-<VERSION>.zip
 ```
 
-Pushing a version tag such as `v0.6.0` runs the GitHub release workflow. It builds
+Pushing a version tag such as `v0.7.0` runs the GitHub release workflow. It builds
 both binaries and publishes the installation ZIP, SHA-256 checksum, and matching
 notes from `docs/releases/<version>.md` as an experimental prerelease.
 
@@ -333,7 +376,8 @@ build/host/miyoosdr --fake --shot out.png
 `make clean` removes `build/host` and `build/miyoo` but keeps `build/research`,
 where local research data lives.
 
-Other modes: `--help` (all options), `--version`, `--dump N` (N sweeps as text), `--probe` (PSD timing), `--zoom MHZ LEVEL`,
+Other modes: `--help` (all options), `--version`, `--scope MHZ` (start on the scope),
+`--panel N` (lower panel 0 to 2), `--dump N` (N sweeps as text), `--probe` (PSD timing), `--zoom MHZ LEVEL`,
 `--shot-after N` (sweeps before `--shot` renders, default 12), `--settings` (read and
 write `settings.txt` even when started with options). Synthetic input is for UI
 development; it does not validate radio sensitivity, timing accuracy or decoding.
