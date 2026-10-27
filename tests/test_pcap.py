@@ -171,12 +171,33 @@ class ParserTests(unittest.TestCase):
         capture = self.load(one(radio(1 << 28, fields) + frame()))
         self.assertEqual(capture.packets[0].signal, -55)
 
-    def test_nonmonotonic_timestamps_clamped(self):
+    def test_small_backward_steps_hold_time(self):
+        # Delivery reordering of a few milliseconds, as in the real capture.
         packet = radio() + frame()
-        capture = self.load(container([(10, 0, packet, None), (12, 0, packet, None),
-                                       (11, 0, packet, None), (9, 0, packet, None),
-                                       (13, 0, packet, None)]))
-        self.assertEqual([capture.packets[i].time for i in range(capture.count)], [0, 2, 2, 2, 3])
+        capture = self.load(container([(10, us, packet, None) for us in (0, 2000, 1000, 3000)]))
+        times = [capture.packets[i].time for i in range(capture.count)]
+        for got, want in zip(times, [0, 0.002, 0.002, 0.003]):
+            self.assertAlmostEqual(got, want, places=9)
+
+    def test_clock_step_back_keeps_later_spacing(self):
+        # The capture clock stepped back 10 s after the third frame.
+        packet = radio() + frame()
+        capture = self.load(container([(s, 0, packet, None) for s in (10, 11, 12, 2, 3, 4, 5)]))
+        self.assertEqual([capture.packets[i].time for i in range(capture.count)], [0, 1, 2, 2, 3, 4, 5])
+        self.assertEqual(capture.duration, 5)
+
+    def test_combined_signal_wins_over_per_chain_fields(self):
+        # mac80211 layout: word 0 has the combined signal, words 1 and 2 repeat
+        # the field per antenna chain after a radiotap namespace reset.
+        words = [(1 << 5) | (1 << 29) | (1 << 31), (1 << 5) | (1 << 11) | (1 << 29) | (1 << 31),
+                 (1 << 5) | (1 << 11)]
+        fields = struct.pack("<bbBbB", -50, -60, 0, -70, 1)
+        capture = self.load(one(radio(fields=fields, words=words) + frame()))
+        self.assertEqual(capture.packets[0].signal, -50)
+
+    def test_action_no_ack_name(self):
+        capture = self.load(one(radio() + frame(0x00e0)))
+        self.assertEqual(self.lib.packet_type_name(ctypes.byref(capture.packets[0])), b"Action No Ack")
 
     def test_control_short_addresses(self):
         for subtype in (7, 8, 9, 10, 11, 12, 13, 14, 15):

@@ -8,12 +8,13 @@
 #include <stdint.h>
 
 #define PCAP_MAX_PACKETS 100000u
+#define PCAP_CLOCK_STEP 1.0          /* Seconds back in time that count as a clock reset. */
 #define PACKET_SIGNAL_UNKNOWN 32767
 #define PACKET_SEQUENCE_UNKNOWN 65535u
 #define PACKET_MCS_UNKNOWN 255u
 
 struct packet_record {
-    double time;                 /* Seconds since first accepted record, clamped monotonic. */
+    double time;                 /* Seconds since first accepted record, never decreasing. */
     uint32_t length;              /* Original 802.11 length, excluding radiotap and FCS. */
     uint16_t frequency, rate_half, sequence;
     int16_t signal;               /* Signed driver dBm value, or PACKET_SIGNAL_UNKNOWN. */

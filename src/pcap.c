@@ -46,20 +46,29 @@ static size_t align_offset(size_t offset, unsigned align)
     return (offset + align - 1) & ~(size_t)(align - 1);
 }
 
+/* Later namespaces can repeat a field, e.g. the signal of each antenna chain.
+ * The first occurrence describes the whole frame, so it wins.
+ */
 static void radio_value(struct packet_record *record, unsigned index,
-                        const uint8_t *value, size_t size, uint8_t *flags)
+                        const uint8_t *value, size_t size, uint8_t *flags,
+                        uint32_t *seen)
 {
+    if (index > 31 || (*seen & (1u << index))) return;
     switch (index) {
-    case 1: if (size >= 1) *flags = value[0]; break;
-    case 2: if (size >= 1) record->rate_half = value[0]; break;
-    case 3: if (size >= 2) record->frequency = le16(value); break;
+    case 1: if (size < 1) return; *flags = value[0]; break;
+    case 2: if (size < 1) return; record->rate_half = value[0]; break;
+    case 3: if (size < 2) return; record->frequency = le16(value); break;
     case 5:
-        if (size >= 1) record->signal = value[0] < 128 ? value[0] : value[0] - 256;
+        if (size < 1) return;
+        record->signal = value[0] < 128 ? value[0] : value[0] - 256;
         break;
     case 19:
-        if (size >= 3 && (value[0] & 2)) record->mcs = value[2];
+        if (size < 3 || !(value[0] & 2)) return;
+        record->mcs = value[2];
         break;
+    default: return;
     }
+    *seen |= 1u << index;
 }
 
 /* Validate all presence words before looking at fields. Unknown vendor data is
@@ -80,6 +89,7 @@ static int radio_parse(const uint8_t *bytes, size_t available, size_t captured,
     };
     size_t total, data, word, words_end;
     unsigned base = 0;
+    uint32_t seen = 0;
     int vendor = 0;
     if (available < 8 || bytes[0] != 0) return -1;
     total = le16(bytes + 2);
@@ -126,7 +136,7 @@ static int radio_parse(const uint8_t *bytes, size_t available, size_t captured,
                     type = le16(bytes + data);
                     size = le16(bytes + data + 2);
                     if (type == 29 || type == 31 || size > total - data - 4) return -1;
-                    radio_value(record, type, bytes + data + 4, size, flags);
+                    radio_value(record, type, bytes + data + 4, size, flags, &seen);
                     data += align_offset(size + 4, 4);
                     if (data > total) return -1;
                 }
@@ -136,7 +146,7 @@ static int radio_parse(const uint8_t *bytes, size_t available, size_t captured,
             data = align_offset(data, alignment[index]);
             size = length[index];
             if (data > total || size > total - data) return -1;
-            radio_value(record, index, bytes + data, size, flags);
+            radio_value(record, index, bytes + data, size, flags, &seen);
             data += size;
         }
         base = reset ? 0 : base + 32;
@@ -223,6 +233,7 @@ int pcap_load(const char *path, struct packet_capture *capture,
     int big, nano;
     size_t capacity = 0, records = 0;
     uint32_t first_seconds = 0, first_fraction = 0;
+    double offset = 0;
     if (!capture) { errorf(error, error_size, "Missing capture destination"); return -1; }
     memset(capture, 0, sizeof(*capture));
     if (error && error_size) error[0] = 0;
@@ -306,9 +317,17 @@ int pcap_load(const char *path, struct packet_capture *capture,
             first_seconds = seconds;
             first_fraction = fraction;
         }
-        record.time = (double)seconds - first_seconds +
-                      ((double)fraction - first_fraction) / scale;
-        if (record.time < capture->duration) record.time = capture->duration;
+        /* A small step back is delivery reordering, so the time holds. A jump
+         * back of over PCAP_CLOCK_STEP is the capture clock being reset: later
+         * frames continue from here and keep their spacing.
+         */
+        record.time = (double)((int64_t)seconds - first_seconds) +
+                      ((double)fraction - first_fraction) / scale + offset;
+        if (record.time < capture->duration) {
+            if (capture->duration - record.time > PCAP_CLOCK_STEP)
+                offset += capture->duration - record.time;
+            record.time = capture->duration;
+        }
         capture->duration = record.time;
         capture->packets[capture->count++] = record;
     }
@@ -329,7 +348,7 @@ const char *packet_type_name(const struct packet_record *packet)
     static const char *management[16] = {
         "Assoc req", "Assoc resp", "Reassoc req", "Reassoc resp", "Probe req", "Probe resp",
         "Mgmt 6", "Mgmt 7", "Beacon", "ATIM", "Disassoc", "Auth", "Deauth", "Action",
-        "Action ACK", "Mgmt 15"
+        "Action No Ack", "Mgmt 15"
     };
     static const char *control[16] = {
         "Control 0", "Control 1", "Trigger", "Control 3", "Control 4", "Control 5", "Control 6",
